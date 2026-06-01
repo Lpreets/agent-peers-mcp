@@ -33,6 +33,7 @@ import { formatInboxBlock } from "./shared/piggyback.ts";
 import { recordDelivered, getRecentDelivered } from "./shared/recent-delivered.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
+import { checkInitialParentLiveness } from "./shared/parent-liveness.ts";
 import type { PeerId } from "./shared/types.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
@@ -281,6 +282,7 @@ async function main() {
     log("agent-peers disabled (set AGENT_PEERS_ENABLED=1 to activate); idle");
     return;
   }
+  const initialParentPid = process.ppid;
 
   // Arm the terminal-title cleanup BEFORE any code path that could call
   // setTabTitle. The `exit` handler covers the explicit process.exit() path,
@@ -460,6 +462,15 @@ async function main() {
 
   const hb = setInterval(async () => {
     if (myId && mySession) {
+      const parent = checkInitialParentLiveness(initialParentPid, process.ppid);
+      if (parent.lost) {
+        log(`initial parent pid=${initialParentPid} is gone (current ppid=${process.ppid}, ppid_changed=${parent.ppidChanged}); exiting orphaned MCP server`);
+        clearInterval(hb);
+        pushStopped = true;
+        if (pushTickTimer) clearTimeout(pushTickTimer);
+        clearTabTitleSync();
+        process.exit(0);
+      }
       try { await client.heartbeat({ id: myId, session_token: mySession }); } catch { /* non-critical */ }
     }
   }, HEARTBEAT_INTERVAL_MS);
