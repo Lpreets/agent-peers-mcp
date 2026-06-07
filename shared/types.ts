@@ -74,6 +74,7 @@ export interface SendMessageResponse {
   ok: boolean;
   error?: string;
   message_id?: number;
+  to_id?: PeerId; // resolved recipient id (from RETURNING) — used by the wake worker
 }
 
 export interface PollMessagesRequest { id: PeerId; session_token: string; }
@@ -104,3 +105,58 @@ export interface RenamePeerResponse {
   error?: string;
   name?: PeerName;
 }
+
+// ----- Idle-safe wake layer (S310 Fix 1) -----
+// Seam between the broker-daemon wake worker (Claude/zany-kiwi) and the
+// tmux wake mechanism (Codex/jolly-moose). The worker decides WHEN to attempt
+// a wake (queue + debounce); the mechanism decides IF the target is safely
+// idle and performs the content-free nudge. Every non-"woke" result is
+// non-fatal telemetry — message delivery is already committed and durable.
+
+export type WakeMode = "off" | "log-only" | "on";
+
+export type WakeResult =
+  | "woke"
+  | "would_wake"               // log-only: validation passed, no keys sent
+  | "would_wake_low_confidence" // log-only: tty+scope ok but missing 2nd identity signal
+  | "skipped_active"           // an active marker was visible → never inject
+  | "skipped_not_idle"         // no positive idle proof (e.g. only one stable sample)
+  | "skipped_no_pane"          // tty resolves to no live tmux pane
+  | "skipped_ambiguous"        // >1 candidate pane matched
+  | "skipped_scope_mismatch"   // pane cwd outside registered project/git_root
+  | "error";                   // mechanism threw (caught, non-fatal)
+
+// Input the worker hands the mechanism. tty is a CANDIDATE only — the
+// mechanism must resolve+validate the live pane before any keystroke.
+export interface WakeTarget {
+  peer_id: PeerId;
+  peer_type: PeerType;
+  name: PeerName;
+  cwd: string;
+  git_root: string | null;
+  tty: string | null;
+  reason_id: string;           // correlation id for telemetry (e.g. "msg-<id>")
+}
+
+// Structured wake telemetry. NEVER carries message text or secrets — only
+// identity + decision + idle-proof summary (per the locked contract).
+export interface WakeDecision {
+  peer_id: PeerId;
+  name: PeerName;
+  peer_type: PeerType;
+  tty: string | null;
+  cwd: string;
+  result: WakeResult;
+  reason_id: string;
+  mode: WakeMode;
+  idle_proof?: string;         // short human summary, no captured body
+  at: string;                  // ISO timestamp
+}
+
+// The contract the mechanism (shared/tmux-wake.ts) implements and the worker
+// imports. Resolves+validates the live pane, requires positive 2-sample idle
+// proof, and performs the content-free nudge only in "on" mode.
+export type WakePeerIfIdle = (
+  target: WakeTarget,
+  mode: WakeMode,
+) => Promise<WakeDecision>;

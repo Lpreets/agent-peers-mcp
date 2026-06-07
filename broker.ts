@@ -16,6 +16,7 @@ import type {
   RenamePeerRequest, RenamePeerResponse,
 } from "./shared/types.ts";
 import { generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
+import { startWakeWorker, type WakeWorker } from "./shared/wake-worker.ts";
 
 export const DEFAULT_DB_PATH = resolve(homedir(), ".agent-peers.db");
 export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
@@ -482,7 +483,7 @@ export function sendMessage(db: Database, req: SendMessageRequest): SendMessageR
       if (!target) return { ok: false, error: `unknown peer: ${req.to_id_or_name}` };
       return { ok: false, error: `target peer stale: ${target.name}` };
     }
-    return { ok: true, message_id: inserted.id };
+    return { ok: true, message_id: inserted.id, to_id: inserted.to_id };
   });
 
   return tx();
@@ -823,6 +824,11 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
     }
   }, GC_INTERVAL_MS);
 
+  // S310 Fix 1 — idle-safe wake worker. Inert unless AGENT_PEERS_WAKE_MODE is
+  // log-only|on (default off → no-op enqueue). Decoupled from delivery: a wake
+  // failure can never roll back or delay a committed message.
+  const wakeWorker: WakeWorker = startWakeWorker(db, { getPeer });
+
   const server = Bun.serve({
     port,
     hostname: "127.0.0.1",
@@ -846,7 +852,17 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
           case "/unregister":    { const b = await readJson<{ id: string; session_token: string }>(req); unregisterPeer(db, b.id, b.session_token); return json({ ok: true }); }
           case "/set-summary":   { const b = await readJson<{ id: string; session_token: string; summary: string }>(req); setPeerSummary(db, b.id, b.session_token, b.summary); return json({ ok: true }); }
           case "/list-peers":    return json(listPeers(db, await readJson(req)));
-          case "/send-message":  return json(sendMessage(db, await readJson(req)));
+          case "/send-message":  {
+            const resp = sendMessage(db, await readJson(req));
+            // Fire-and-forget wake enqueue AFTER the message is durably
+            // committed. Never awaited → delivery latency/success is fully
+            // independent of the wake path (no-op when the flag is off).
+            if (resp.ok && resp.message_id != null && resp.to_id) {
+              try { wakeWorker.enqueue(resp.to_id, `msg-${resp.message_id}`); }
+              catch (e) { console.error("[broker] wake enqueue error (non-fatal):", e); }
+            }
+            return json(resp);
+          }
           case "/poll-messages": { const b = await readJson<{ id: string; session_token: string }>(req); return json({ messages: pollMessages(db, b.id, b.session_token) }); }
           case "/ack-messages":  return json(ackMessages(db, await readJson(req)));
           case "/rename-peer":   return json(renamePeer(db, await readJson(req)));
@@ -868,6 +884,7 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
 
   const cleanup = () => {
     clearInterval(gcTimer);
+    wakeWorker.stop();
     server.stop(true);
     db.close();
     process.exit(0);
