@@ -18,6 +18,7 @@ import { join } from "node:path";
 import {
   validateSecretFilePerms,
   readSharedSecret,
+  readSharedSecretOrThrow,
 } from "../shared/shared-secret.ts";
 
 const scratchDirs: string[] = [];
@@ -109,5 +110,31 @@ describe("readSharedSecret", () => {
     writeFileSync(p, expected, { mode: 0o600 });
     chmodSync(p, 0o600);
     expect(readSharedSecret(p)).toBe(expected);
+  });
+});
+
+describe("readSharedSecretOrThrow", () => {
+  test("throws for missing, insecure, and too-short files", () => {
+    const dir = mkScratch();
+    expect(() => readSharedSecretOrThrow(join(dir, "missing"))).toThrow(/not found/);
+
+    const insecure = join(dir, "insecure");
+    writeFileSync(insecure, "x".repeat(64), { mode: 0o644 });
+    chmodSync(insecure, 0o644);
+    expect(() => readSharedSecretOrThrow(insecure)).toThrow(/mode 644/);
+
+    const short = join(dir, "short");
+    writeFileSync(short, "short", { mode: 0o600 });
+    chmodSync(short, 0o600);
+    expect(() => readSharedSecretOrThrow(short)).toThrow(/too short/);
+  });
+
+  test("returns the secret for a well-formed file", () => {
+    const dir = mkScratch();
+    const p = join(dir, "secret");
+    const expected = "b".repeat(64);
+    writeFileSync(p, expected, { mode: 0o600 });
+    chmodSync(p, 0o600);
+    expect(readSharedSecretOrThrow(p)).toBe(expected);
   });
 });

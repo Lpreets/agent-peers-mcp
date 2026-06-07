@@ -9,6 +9,7 @@ import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, chmodSync, openSync, closeSync, writeSync, fsyncSync, linkSync, unlinkSync, existsSync, renameSync, statSync } from "node:fs";
 import { validateSecretFilePerms } from "./shared/shared-secret.ts";
+import { isLoopbackHost, resolveBrokerBindConfig } from "./shared/broker-config.ts";
 import type {
   RegisterRequest, RegisterResponse, Peer,
   ListPeersRequest, SendMessageRequest, SendMessageResponse,
@@ -836,7 +837,27 @@ export function ensureSharedSecret(path: string): string {
   return persisted;
 }
 
-export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_SECRET_PATH) {
+export function startBroker(
+  port: number,
+  dbPath: string,
+  secretPath = DEFAULT_SECRET_PATH,
+  bindHost = "127.0.0.1",
+) {
+  const nonLoopback = !isLoopbackHost(bindHost);
+  if (nonLoopback) {
+    if (!existsSync(secretPath)) {
+      throw new Error(
+        `broker: refusing non-loopback bind ${bindHost} without an existing shared secret at ${secretPath}`
+      );
+    }
+    validateSecretFilePerms(secretPath);
+    const existingSecret = readFileSync(secretPath, "utf8").trim();
+    if (existingSecret.length < 32) {
+      throw new Error(
+        `broker: refusing non-loopback bind ${bindHost}; shared secret at ${secretPath} is too short (${existingSecret.length} chars)`
+      );
+    }
+  }
   const db = initDb(dbPath);
   const sharedSecret = ensureSharedSecret(secretPath);
 
@@ -861,12 +882,12 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
 
   const server = Bun.serve({
     port,
-    hostname: "127.0.0.1",
+    hostname: bindHost,
     async fetch(req) {
       const url = new URL(req.url);
       try {
         if (req.method === "GET" && url.pathname === "/health") {
-          return json({ ok: true, pid: process.pid });
+          return json(nonLoopback ? { ok: true } : { ok: true, pid: process.pid });
         }
         if (req.method !== "POST") return json({ error: "method not allowed" }, { status: 405 });
 
@@ -911,7 +932,7 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
 
-  console.error(`[broker] listening on http://127.0.0.1:${port}, db=${dbPath}, pid=${process.pid}`);
+  console.error(`[broker] listening on http://${bindHost}:${server.port}, db=${dbPath}, pid=${process.pid}`);
   return { server, db, gcTimer };
 }
 
@@ -919,5 +940,6 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
 export { NAME_REGEX, NAME_MAX_LEN, isValidName };
 
 if (import.meta.main) {
-  startBroker(DEFAULT_PORT, process.env.AGENT_PEERS_DB || DEFAULT_DB_PATH);
+  const bind = resolveBrokerBindConfig();
+  startBroker(DEFAULT_PORT, process.env.AGENT_PEERS_DB || DEFAULT_DB_PATH, bind.secretPath, bind.bindHost);
 }
