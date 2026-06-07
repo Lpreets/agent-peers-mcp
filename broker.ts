@@ -268,13 +268,52 @@ function* nameCandidates(requested: string | undefined): Generator<string> {
   }
 }
 
+function normalizedTty(tty: string | null | undefined): string | null {
+  const trimmed = tty?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function clearUndeliveredLeasesForPeer(db: Database, id: string): void {
+  db.query(
+    `UPDATE messages SET lease_token = NULL, lease_expires_at = NULL
+     WHERE to_id = ? AND acked = 0`
+  ).run(id);
+}
+
 export function registerPeer(db: Database, req: RegisterRequest): RegisterResponse {
   const ts = nowIso();
+  const tty = normalizedTty(req.tty);
   // Every register (fresh or reclaim) issues a new session_token. Reclaim
   // rotates the token so the previous session's client (if it's still alive
   // elsewhere) can no longer act as this peer — the token is the session
   // boundary.
   const session_token = randomUUID();
+
+  // Physical-session reconnect fast-path: one interactive tty/cwd/type maps to
+  // one logical peer. Replace in place even when the previous child is still
+  // heartbeating, preserving id/name and inbox continuity while rotating the
+  // session_token so old-child mutations no-op.
+  if (tty) {
+    const row = db.query<{ id: string; name: string }, [string, string | null, string]>(
+      `SELECT id, name FROM peers
+       WHERE peer_type = ? AND cwd IS ? AND tty = ?
+       ORDER BY last_seen DESC
+       LIMIT 1`
+    ).get(req.peer_type, req.cwd, tty);
+    if (row) {
+      db.query(
+        `UPDATE peers
+           SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
+               session_token = ?, last_seen = ?
+         WHERE id = ?`
+      ).run(
+        req.peer_type, req.pid, req.cwd, req.git_root, tty, req.summary,
+        session_token, ts, row.id,
+      );
+      clearUndeliveredLeasesForPeer(db, row.id);
+      return { id: row.id, name: row.name, session_token };
+    }
+  }
 
   // Reclaim fast-path: stale peer with matching name → UPDATE in place, preserve UUID.
   if (req.name && isValidName(req.name)) {
@@ -283,9 +322,9 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
       `UPDATE peers
          SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
              session_token = ?, last_seen = ?
-       WHERE name = ? AND last_seen < ?`
+      WHERE name = ? AND last_seen < ?`
     ).run(
-      req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
+      req.peer_type, req.pid, req.cwd, req.git_root, tty, req.summary,
       session_token, ts, req.name, cutoff,
     );
     if ((reclaim.changes ?? 0) > 0) {
@@ -299,10 +338,7 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
         // first poll return the backlog immediately. Orphan observability
         // is unaffected (acked=0 rows still show up in cli.ts orphaned-messages
         // if the reclaimed peer dies again before reading).
-        db.query(
-          `UPDATE messages SET lease_token = NULL, lease_expires_at = NULL
-           WHERE to_id = ? AND acked = 0`
-        ).run(row.id);
+        clearUndeliveredLeasesForPeer(db, row.id);
         return { id: row.id, name: req.name, session_token };
       }
     }
@@ -317,7 +353,7 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
   for (const candidate of nameCandidates(req.name)) {
     try {
       insert.run(
-        id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
+        id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, tty, req.summary,
         session_token, ts, ts,
       );
       return { id, name: candidate, session_token };

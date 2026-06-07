@@ -146,6 +146,75 @@ test("registerPeer does NOT reclaim a LIVE peer, falls through to suffix", () =>
   expect(second.name).toBe("active-2");
 });
 
+test("registerPeer replaces live peer in same tty cwd and type, preserving id and name", () => {
+  const first = reg({ peer_type: "codex", cwd: "/repo", tty: "pts/9", pid: 101 });
+  const second = reg({ peer_type: "codex", cwd: "/repo", tty: "pts/9", pid: 202 });
+
+  expect(second.id).toBe(first.id);
+  expect(second.name).toBe(first.name);
+  expect(second.session_token).not.toBe(first.session_token);
+  expect(listPeers(db, { scope: "machine", cwd: "/any", git_root: null, peer_type: "codex" })).toHaveLength(1);
+
+  const row = db.query<{ pid: number; cwd: string; tty: string; peer_type: string }, [string]>(
+    "SELECT pid, cwd, tty, peer_type FROM peers WHERE id = ?"
+  ).get(second.id)!;
+  expect(row).toEqual({ pid: 202, cwd: "/repo", tty: "pts/9", peer_type: "codex" });
+
+  heartbeatPeer(db, first.id, first.session_token);
+  expect(getPeer(db, second.id)?.pid).toBe(202);
+});
+
+test("registerPeer same tty cwd and type clears stale leases for replaced row", () => {
+  const sender = reg({ name: "sender" });
+  const first = reg({ name: "receiver", peer_type: "codex", cwd: "/repo", tty: "pts/9" });
+
+  sendMessage(db, {
+    from_id: sender.id, session_token: sender.session_token,
+    to_id_or_name: "receiver", text: "leased",
+  });
+  const leased = pollMessages(db, first.id, first.session_token);
+  expect(leased).toHaveLength(1);
+
+  const second = reg({ name: "new-name", peer_type: "codex", cwd: "/repo", tty: "pts/9", pid: 303 });
+  expect(second.id).toBe(first.id);
+  expect(second.name).toBe("receiver");
+
+  const backlog = pollMessages(db, second.id, second.session_token);
+  expect(backlog.map((m) => m.text)).toEqual(["leased"]);
+});
+
+test("registerPeer same tty cwd and type replaces named live peer instead of suffixing", () => {
+  const first = reg({ name: "stable", peer_type: "codex", cwd: "/repo", tty: "pts/9", pid: 101 });
+  const second = reg({ name: "stable", peer_type: "codex", cwd: "/repo", tty: "pts/9", pid: 202 });
+
+  expect(second.id).toBe(first.id);
+  expect(second.name).toBe("stable");
+  expect(second.session_token).not.toBe(first.session_token);
+  expect(getPeerByName(db, "stable-2")).toBeNull();
+});
+
+test("registerPeer keeps distinct peers for different tty cwd or empty tty", () => {
+  const base = reg({ name: "base", peer_type: "codex", cwd: "/repo", tty: "pts/9" });
+  const otherTty = reg({ name: "base", peer_type: "codex", cwd: "/repo", tty: "pts/10" });
+  const otherCwd = reg({ name: "base", peer_type: "codex", cwd: "/other", tty: "pts/9" });
+  const emptyA = reg({ name: "empty", peer_type: "codex", cwd: "/repo", tty: "" });
+  const emptyB = reg({ name: "empty", peer_type: "codex", cwd: "/repo", tty: "" });
+  const nullA = reg({ name: "nulltty", peer_type: "codex", cwd: "/repo", tty: null });
+  const nullB = reg({ name: "nulltty", peer_type: "codex", cwd: "/repo", tty: null });
+  const otherType = reg({ name: "base", peer_type: "claude", cwd: "/repo", tty: "pts/9" });
+
+  expect(otherTty.id).not.toBe(base.id);
+  expect(otherTty.name).toBe("base-2");
+  expect(otherCwd.id).not.toBe(base.id);
+  expect(otherCwd.name).toBe("base-3");
+  expect(emptyA.id).not.toBe(emptyB.id);
+  expect(emptyB.name).toBe("empty-2");
+  expect(nullA.id).not.toBe(nullB.id);
+  expect(nullB.name).toBe("nulltty-2");
+  expect(otherType.id).not.toBe(base.id);
+  expect(otherType.name).toBe("base-4");
+});
+
 test("registerPeer is atomic under simulated interleaving", () => {
   db.query(
     `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
