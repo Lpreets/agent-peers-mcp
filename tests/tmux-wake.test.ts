@@ -57,7 +57,35 @@ afterEach(() => {
 });
 
 const CODEX_IDLE = "› Summarize recent commits\n\ngpt-5.5 low · 0.137.0 · Context 100%…";
-const CLAUDE_IDLE = "❯\n\nOpus 4.8 Low · bypass permissions on";
+const CLAUDE_2168_IDLE = `
+ ▐▛███▜▌   Claude Code v2.1.168
+▝▜█████▛▘  Opus 4.8 · ~/Projects/MSAASA
+  ▘▘ ▝▝    0 awaiting input · 0 working · 12 completed
+
+Completed
+✻ python print script            Printed 140 numbered lines (1–140) via a …  10s
+∙ server:agent-peers             starting…                                    5s
+… 8 more
+
+────────────────────────────────────────────────────────────────────────────────
+❯ describe a task for a new session
+────────────────────────────────────────────────────────────────────────────────
+  enter to open · space to reply · ctrl+x to delete · ? for shortcuts`;
+const CLAUDE_2168_ACTIVE = `
+ ▐▛███▜▌   Claude Code v2.1.168
+▝▜█████▛▘  Opus 4.8 · ~/Projects/MSAASA
+  ▘▘ ▝▝    0 awaiting input · 1 working · 10 completed
+
+Working
+* Run a harmless…                Bash sleep 60                                7s
+
+Completed
+✻ shell command execution        sleep 60 finished successfully               1m
+
+────────────────────────────────────────────────────────────────────────────────
+❯ describe a task for a new session
+────────────────────────────────────────────────────────────────────────────────
+  enter to open · space to reply · ctrl+x to delete · ? for shortcuts`;
 
 test("off mode does not inspect tmux or send keys", async () => {
   const { sent, literals } = installFakeTmux({
@@ -97,7 +125,7 @@ test("on mode sends content-free Codex F4 plus fixed prompt and delayed Enter", 
 test("on mode sends fixed prompt only for Claude", async () => {
   const { sent, literals } = installFakeTmux({
     panes: [{ tty: "pts/4", pane_id: "%4", command: "claude", cwd: "/repo", title: "peer:zany-claude" }],
-    captures: [CLAUDE_IDLE, CLAUDE_IDLE, CLAUDE_IDLE],
+    captures: [CLAUDE_2168_IDLE, CLAUDE_2168_IDLE, CLAUDE_2168_IDLE],
   });
   const res = await wakePeerIfIdle(target({
     peer_type: "claude",
@@ -107,6 +135,35 @@ test("on mode sends fixed prompt only for Claude", async () => {
   expect(res.result).toBe("woke");
   expect(sent).toEqual(["Enter"]);
   expect(literals).toEqual(["Check agent-peers now."]);
+});
+
+test("Claude 2.1.168 idle status line is accepted, but active working state is not", async () => {
+  const { sent: idleSent, literals: idleLiterals } = installFakeTmux({
+    panes: [{ tty: "pts/4", pane_id: "%4", command: "claude", cwd: "/repo", title: "peer:zany-claude" }],
+    captures: [CLAUDE_2168_IDLE, CLAUDE_2168_IDLE],
+  });
+  const idle = await wakePeerIfIdle(target({
+    peer_type: "claude",
+    name: "zany-claude",
+    tty: "pts/4",
+  }), "log-only");
+  expect(idle.result).toBe("would_wake");
+  expect(idle.idle_proof).toContain("2 stable claude idle samples");
+  expect(idleSent).toEqual([]);
+  expect(idleLiterals).toEqual([]);
+
+  const { sent: activeSent, literals: activeLiterals } = installFakeTmux({
+    panes: [{ tty: "pts/4", pane_id: "%4", command: "claude", cwd: "/repo", title: "peer:zany-claude" }],
+    captures: [CLAUDE_2168_ACTIVE, CLAUDE_2168_ACTIVE],
+  });
+  const active = await wakePeerIfIdle(target({
+    peer_type: "claude",
+    name: "zany-claude",
+    tty: "pts/4",
+  }), "on");
+  expect(active.result).toBe("skipped_not_idle");
+  expect(activeSent).toEqual([]);
+  expect(activeLiterals).toEqual([]);
 });
 
 test("TOCTOU recheck skips if pane becomes active after idle proof but before nudge", async () => {
