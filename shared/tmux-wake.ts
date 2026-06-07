@@ -20,7 +20,7 @@ type TmuxWakeAdapter = {
 const ACTIVE_MARKERS =
   /esc to interrupt|Working \(|tool_use|Bash\(|Running|Thinking|Messages to be submitted|Do you want to/i;
 const CODEX_EXTRA_ACTIVE = /Update available|Update now|new Codex version|Hooks need review/i;
-const CLAUDE_IDLE = /bypass permissions on|Context [0-9]+%( [Ll]eft)?/;
+const CLAUDE_IDLE = /0 awaiting input[^\n]{1,8}\b0 working\b/;
 const CODEX_IDLE = /gpt-5[\s\S]*Context [0-9]+%( [Ll]eft)?/;
 const WAKE_TEXT = "Check agent-peers now.";
 
