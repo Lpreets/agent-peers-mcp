@@ -9,6 +9,7 @@ import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, chmodSync, openSync, closeSync, writeSync, fsyncSync, linkSync, unlinkSync, existsSync, renameSync, statSync } from "node:fs";
 import { validateSecretFilePerms } from "./shared/shared-secret.ts";
+import { isLoopbackHost, resolveBrokerBindConfig } from "./shared/broker-config.ts";
 import type {
   RegisterRequest, RegisterResponse, Peer,
   ListPeersRequest, SendMessageRequest, SendMessageResponse,
@@ -269,13 +270,52 @@ function* nameCandidates(requested: string | undefined): Generator<string> {
   }
 }
 
+function normalizedTty(tty: string | null | undefined): string | null {
+  const trimmed = tty?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function clearUndeliveredLeasesForPeer(db: Database, id: string): void {
+  db.query(
+    `UPDATE messages SET lease_token = NULL, lease_expires_at = NULL
+     WHERE to_id = ? AND acked = 0`
+  ).run(id);
+}
+
 export function registerPeer(db: Database, req: RegisterRequest): RegisterResponse {
   const ts = nowIso();
+  const tty = normalizedTty(req.tty);
   // Every register (fresh or reclaim) issues a new session_token. Reclaim
   // rotates the token so the previous session's client (if it's still alive
   // elsewhere) can no longer act as this peer — the token is the session
   // boundary.
   const session_token = randomUUID();
+
+  // Physical-session reconnect fast-path: one interactive tty/cwd/type maps to
+  // one logical peer. Replace in place even when the previous child is still
+  // heartbeating, preserving id/name and inbox continuity while rotating the
+  // session_token so old-child mutations no-op.
+  if (tty) {
+    const row = db.query<{ id: string; name: string }, [string, string | null, string]>(
+      `SELECT id, name FROM peers
+       WHERE peer_type = ? AND cwd IS ? AND tty = ?
+       ORDER BY last_seen DESC
+       LIMIT 1`
+    ).get(req.peer_type, req.cwd, tty);
+    if (row) {
+      db.query(
+        `UPDATE peers
+           SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
+               session_token = ?, last_seen = ?
+         WHERE id = ?`
+      ).run(
+        req.peer_type, req.pid, req.cwd, req.git_root, tty, req.summary,
+        session_token, ts, row.id,
+      );
+      clearUndeliveredLeasesForPeer(db, row.id);
+      return { id: row.id, name: row.name, session_token };
+    }
+  }
 
   // Reclaim fast-path: stale peer with matching name → UPDATE in place, preserve UUID.
   if (req.name && isValidName(req.name)) {
@@ -284,9 +324,9 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
       `UPDATE peers
          SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
              session_token = ?, last_seen = ?
-       WHERE name = ? AND last_seen < ?`
+      WHERE name = ? AND last_seen < ?`
     ).run(
-      req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
+      req.peer_type, req.pid, req.cwd, req.git_root, tty, req.summary,
       session_token, ts, req.name, cutoff,
     );
     if ((reclaim.changes ?? 0) > 0) {
@@ -300,10 +340,7 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
         // first poll return the backlog immediately. Orphan observability
         // is unaffected (acked=0 rows still show up in cli.ts orphaned-messages
         // if the reclaimed peer dies again before reading).
-        db.query(
-          `UPDATE messages SET lease_token = NULL, lease_expires_at = NULL
-           WHERE to_id = ? AND acked = 0`
-        ).run(row.id);
+        clearUndeliveredLeasesForPeer(db, row.id);
         return { id: row.id, name: req.name, session_token };
       }
     }
@@ -318,7 +355,7 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
   for (const candidate of nameCandidates(req.name)) {
     try {
       insert.run(
-        id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
+        id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, tty, req.summary,
         session_token, ts, ts,
       );
       return { id, name: candidate, session_token };
@@ -801,7 +838,27 @@ export function ensureSharedSecret(path: string): string {
   return persisted;
 }
 
-export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_SECRET_PATH) {
+export function startBroker(
+  port: number,
+  dbPath: string,
+  secretPath = DEFAULT_SECRET_PATH,
+  bindHost = "127.0.0.1",
+) {
+  const nonLoopback = !isLoopbackHost(bindHost);
+  if (nonLoopback) {
+    if (!existsSync(secretPath)) {
+      throw new Error(
+        `broker: refusing non-loopback bind ${bindHost} without an existing shared secret at ${secretPath}`
+      );
+    }
+    validateSecretFilePerms(secretPath);
+    const existingSecret = readFileSync(secretPath, "utf8").trim();
+    if (existingSecret.length < 32) {
+      throw new Error(
+        `broker: refusing non-loopback bind ${bindHost}; shared secret at ${secretPath} is too short (${existingSecret.length} chars)`
+      );
+    }
+  }
   const db = initDb(dbPath);
   const sharedSecret = ensureSharedSecret(secretPath);
 
@@ -831,12 +888,12 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
 
   const server = Bun.serve({
     port,
-    hostname: "127.0.0.1",
+    hostname: bindHost,
     async fetch(req) {
       const url = new URL(req.url);
       try {
         if (req.method === "GET" && url.pathname === "/health") {
-          return json({ ok: true, pid: process.pid });
+          return json(nonLoopback ? { ok: true } : { ok: true, pid: process.pid });
         }
         if (req.method !== "POST") return json({ error: "method not allowed" }, { status: 405 });
 
@@ -892,7 +949,7 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
 
-  console.error(`[broker] listening on http://127.0.0.1:${port}, db=${dbPath}, pid=${process.pid}`);
+  console.error(`[broker] listening on http://${bindHost}:${server.port}, db=${dbPath}, pid=${process.pid}`);
   return { server, db, gcTimer };
 }
 
@@ -900,5 +957,6 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
 export { NAME_REGEX, NAME_MAX_LEN, isValidName };
 
 if (import.meta.main) {
-  startBroker(DEFAULT_PORT, process.env.AGENT_PEERS_DB || DEFAULT_DB_PATH);
+  const bind = resolveBrokerBindConfig();
+  startBroker(DEFAULT_PORT, process.env.AGENT_PEERS_DB || DEFAULT_DB_PATH, bind.secretPath, bind.bindHost);
 }

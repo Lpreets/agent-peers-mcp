@@ -62,6 +62,18 @@ export function readSharedSecret(path: string = DEFAULT_SECRET_PATH): string | n
   }
 }
 
+export function readSharedSecretOrThrow(path: string = DEFAULT_SECRET_PATH): string {
+  if (!existsSync(path)) {
+    throw new Error(`shared secret not found at ${path}`);
+  }
+  validateSecretFilePerms(path);
+  const s = readFileSync(path, "utf8").trim();
+  if (s.length < 32) {
+    throw new Error(`shared secret at ${path} is too short (${s.length} chars), expected at least 32`);
+  }
+  return s;
+}
+
 // Block until the broker has written the secret file. Used after ensureBroker
 // spawns the broker daemon — the broker may take up to a few hundred ms to
 // provision the secret, so clients poll briefly before giving up.

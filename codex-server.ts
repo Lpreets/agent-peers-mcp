@@ -69,7 +69,8 @@ import {
 
 import { createClient } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
-import { waitForSharedSecret } from "./shared/shared-secret.ts";
+import { readSharedSecretOrThrow, waitForSharedSecret } from "./shared/shared-secret.ts";
+import { resolveBrokerClientConfig } from "./shared/broker-config.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
@@ -80,8 +81,8 @@ import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import { checkInitialParentLiveness } from "./shared/parent-liveness.ts";
 import type { PeerId, LeasedMessage } from "./shared/types.ts";
 
-const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const BROKER_CONFIG = resolveBrokerClientConfig();
+const BROKER_URL = BROKER_CONFIG.brokerUrl;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 
@@ -574,8 +575,13 @@ async function main() {
   startTabTitleKeepalive();
 
   const brokerScriptUrl = new URL("./broker.ts", import.meta.url).href;
-  await ensureBroker(isBrokerAlive, brokerScriptUrl);
-  const sharedSecret = await waitForSharedSecret();
+  await ensureBroker(isBrokerAlive, brokerScriptUrl, {
+    remoteMode: BROKER_CONFIG.remoteMode,
+    brokerUrl: BROKER_URL,
+  });
+  const sharedSecret = BROKER_CONFIG.remoteMode
+    ? readSharedSecretOrThrow(BROKER_CONFIG.secretPath)
+    : await waitForSharedSecret(BROKER_CONFIG.secretPath);
   client = createClient(BROKER_URL, sharedSecret);
 
   myCwd = process.cwd();

@@ -3,7 +3,7 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { startBroker } from "../broker.ts";
 import { createClient } from "../shared/broker-client.ts";
-import { readFileSync, unlinkSync, existsSync } from "node:fs";
+import { chmodSync, readFileSync, unlinkSync, existsSync, writeFileSync } from "node:fs";
 
 const TEST_DB = "/tmp/agent-peers-e2e-" + Date.now() + ".db";
 const TEST_SECRET = "/tmp/agent-peers-e2e-secret-" + Date.now();
@@ -99,4 +99,49 @@ test("broker rejects HTTP requests without the shared-secret header (auth regres
     body: JSON.stringify({ scope: "machine", cwd: "/any", git_root: null }),
   });
   expect(res.status).toBe(401);
+});
+
+test("broker refuses non-loopback bind without an existing secret", () => {
+  const db = "/tmp/agent-peers-nonloopback-no-secret-" + Date.now() + ".db";
+  const secret = "/tmp/agent-peers-nonloopback-no-secret-" + Date.now();
+  expect(() => startBroker(0, db, secret, "0.0.0.0")).toThrow(/refusing non-loopback bind/);
+  for (const p of [db, secret]) if (existsSync(p)) unlinkSync(p);
+});
+
+test("broker refuses non-loopback bind with an insecure secret before opening DB", () => {
+  const db = "/tmp/agent-peers-nonloopback-bad-secret-" + Date.now() + ".db";
+  const secret = "/tmp/agent-peers-nonloopback-bad-secret-" + Date.now();
+  writeFileSync(secret, "x".repeat(64), { mode: 0o644 });
+  chmodSync(secret, 0o644);
+  expect(() => startBroker(0, db, secret, "0.0.0.0")).toThrow(/mode 644/);
+  expect(existsSync(db)).toBe(false);
+  for (const p of [db, secret]) if (existsSync(p)) unlinkSync(p);
+});
+
+test("broker non-loopback health omits pid details", async () => {
+  const db = "/tmp/agent-peers-nonloopback-health-" + Date.now() + ".db";
+  const secret = "/tmp/agent-peers-nonloopback-health-secret-" + Date.now();
+  const local = startBroker(0, db, secret, "127.0.0.1");
+  try {
+    const url = `http://127.0.0.1:${local.server.port}/health`;
+    const body = await (await fetch(url)).json() as { ok: boolean; pid?: number };
+    expect(body.ok).toBe(true);
+    expect(body.pid).toBe(process.pid);
+  } finally {
+    clearInterval(local.gcTimer);
+    local.server.stop(true);
+    local.db.close();
+  }
+
+  const nonLoopback = startBroker(0, db, secret, "0.0.0.0");
+  try {
+    const url = `http://127.0.0.1:${nonLoopback.server.port}/health`;
+    const body = await (await fetch(url)).json() as { ok: boolean; pid?: number };
+    expect(body).toEqual({ ok: true });
+  } finally {
+    clearInterval(nonLoopback.gcTimer);
+    nonLoopback.server.stop(true);
+    nonLoopback.db.close();
+    for (const p of [db, secret]) if (existsSync(p)) unlinkSync(p);
+  }
 });

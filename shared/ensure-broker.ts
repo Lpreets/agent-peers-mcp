@@ -9,8 +9,16 @@ import { fileURLToPath } from "node:url";
 export async function ensureBroker(
   isAlive: () => Promise<boolean>,
   brokerScriptUrl: string, // pass `new URL("./broker.ts", import.meta.url).href`
+  opts: { remoteMode?: boolean; brokerUrl?: string } = {},
 ): Promise<void> {
   if (await isAlive()) return;
+
+  if (opts.remoteMode) {
+    throw new Error(
+      `ensureBroker: remote broker unavailable${opts.brokerUrl ? ` at ${opts.brokerUrl}` : ""}; ` +
+      "remote mode disables local broker auto-spawn"
+    );
+  }
 
   // Resolve via fileURLToPath — required because the project path contains a space
   // AND an apostrophe ("Brayden's Projects"). URL.pathname returns URL-encoded
