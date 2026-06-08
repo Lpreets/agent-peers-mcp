@@ -9,6 +9,7 @@ export interface Peer {
   id: PeerId;
   name: PeerName;
   peer_type: PeerType;
+  host: string | null;
   pid: number;
   cwd: string;
   git_root: string | null;
@@ -35,6 +36,7 @@ export interface LeasedMessage {
 
 export interface RegisterRequest {
   peer_type: PeerType;
+  host?: string | null;
   name?: PeerName;
   pid: number;
   cwd: string;

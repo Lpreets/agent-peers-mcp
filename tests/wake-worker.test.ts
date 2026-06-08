@@ -7,7 +7,7 @@ import type { Peer, WakeDecision, WakeTarget, WakeMode } from "../shared/types.t
 // queue/debounce/decoupling behaviour without any tmux or real DB.
 function makePeer(over: Partial<Peer> = {}): Peer {
   return {
-    id: "peer-1", name: "zappy-yak", peer_type: "codex", pid: 4242,
+    id: "peer-1", name: "zappy-yak", peer_type: "codex", host: "lpreet-pco", pid: 4242,
     cwd: "/home/x/proj", git_root: "/home/x/proj", tty: "/dev/pts/9",
     summary: "", registered_at: "2026-06-07T00:00:00.000Z",
     last_seen: "2026-06-07T00:00:00.000Z", ...over,

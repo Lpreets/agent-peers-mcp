@@ -140,8 +140,58 @@ test("initDb is idempotent on an already-migrated DB", () => {
       `SELECT name FROM pragma_table_info('peers')`
     ).all().map((r) => r.name);
     expect(cols).toContain("session_token");
+    expect(cols).toContain("host");
   } finally {
     db2.close();
+  }
+});
+
+test("initDb adds nullable host column to existing migrated peers without data loss", () => {
+  TEST_DB = `/tmp/agent-peers-migration-host-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+  const setup = new Database(TEST_DB);
+  setup.exec("PRAGMA journal_mode = WAL;");
+  setup.exec(`
+    CREATE TABLE peers (
+      id            TEXT PRIMARY KEY,
+      name          TEXT NOT NULL UNIQUE,
+      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex')),
+      pid           INTEGER,
+      cwd           TEXT,
+      git_root      TEXT,
+      tty           TEXT,
+      summary       TEXT DEFAULT '',
+      session_token TEXT NOT NULL,
+      registered_at TEXT NOT NULL,
+      last_seen     TEXT NOT NULL
+    );
+  `);
+  setup.exec(`
+    CREATE TABLE messages (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_id           TEXT NOT NULL,
+      to_id             TEXT NOT NULL,
+      text              TEXT NOT NULL,
+      sent_at           TEXT NOT NULL,
+      acked             INTEGER NOT NULL DEFAULT 0,
+      lease_token       TEXT,
+      lease_expires_at  TEXT
+    );
+  `);
+  const ts = new Date().toISOString();
+  setup.query(
+    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run("hostless-1", "hostless", "claude", 1, "/x", null, "pts/1", "", "token", ts, ts);
+  setup.close();
+
+  const db = initDb(TEST_DB);
+  try {
+    const row = db.query<{ host: string | null; name: string }, []>(
+      "SELECT host, name FROM peers WHERE id = 'hostless-1'"
+    ).get();
+    expect(row).toEqual({ host: null, name: "hostless" });
+  } finally {
+    db.close();
   }
 });
 

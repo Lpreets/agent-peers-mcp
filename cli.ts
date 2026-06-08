@@ -4,6 +4,7 @@
 
 import { createClient } from "./shared/broker-client.ts";
 import { readSharedSecret } from "./shared/shared-secret.ts";
+import { resolveHostId } from "./shared/host-id.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -35,6 +36,7 @@ async function cmdPeers() {
   }
   for (const p of peers) {
     console.log(`${p.name}  (${p.peer_type})  id=${p.id}`);
+    if (p.host) console.log(`  host=${p.host}`);
     console.log(`  cwd=${p.cwd}${p.tty ? `  tty=${p.tty}` : ""}`);
     if (p.summary) console.log(`  summary: ${p.summary}`);
     console.log(`  last_seen=${p.last_seen}`);
@@ -48,6 +50,7 @@ async function cmdSend(targetNameOrId: string, message: string) {
   const operatorName = `cli-operator-${process.pid}`;
   const reg = await client.register({
     peer_type: "claude",
+    host: resolveHostId(),
     name: operatorName,
     pid: process.pid,
     cwd: process.cwd(),

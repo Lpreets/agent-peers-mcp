@@ -28,6 +28,7 @@ import { ensureBroker } from "./shared/ensure-broker.ts";
 import { readSharedSecretOrThrow, waitForSharedSecret } from "./shared/shared-secret.ts";
 import { resolveBrokerClientConfig } from "./shared/broker-config.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
+import { resolveHostId } from "./shared/host-id.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
 import { formatInboxBlock } from "./shared/piggyback.ts";
@@ -190,6 +191,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         [
           `Peer ${p.name} (${p.peer_type})`,
           `  ID: ${p.id}`,
+          p.host ? `  Host: ${p.host}` : null,
           `  CWD: ${p.cwd}`,
           p.tty ? `  TTY: ${p.tty}` : null,
           p.summary ? `  Summary: ${p.summary}` : null,
@@ -331,6 +333,7 @@ async function main() {
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
+  const host = resolveHostId();
 
   // Best-effort auto-summary with 3s cap; register may proceed with empty summary.
   let initialSummary = "";
@@ -351,6 +354,7 @@ async function main() {
 
   const reg = await client.register({
     peer_type: "claude",
+    host,
     name: process.env.PEER_NAME,
     pid: process.pid,
     cwd: myCwd,
