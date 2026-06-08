@@ -141,6 +141,11 @@ test("initDb is idempotent on an already-migrated DB", () => {
     ).all().map((r) => r.name);
     expect(cols).toContain("session_token");
     expect(cols).toContain("host");
+
+    const tables = db2.query<{ name: string }, []>(
+      "SELECT name FROM sqlite_master WHERE type='table'"
+    ).all().map((r) => r.name);
+    expect(tables).toContain("host_intents");
   } finally {
     db2.close();
   }

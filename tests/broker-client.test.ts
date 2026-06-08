@@ -10,8 +10,11 @@ const TEST_SECRET = "/tmp/agent-peers-e2e-secret-" + Date.now();
 const TEST_PORT = 7911;
 let handle: ReturnType<typeof startBroker>;
 let testSecret: string;
+let previousWakeMode: string | undefined;
 
 beforeAll(() => {
+  previousWakeMode = process.env.AGENT_PEERS_WAKE_MODE;
+  process.env.AGENT_PEERS_WAKE_MODE = "log-only";
   handle = startBroker(TEST_PORT, TEST_DB, TEST_SECRET);
   testSecret = readFileSync(TEST_SECRET, "utf8").trim();
 });
@@ -20,6 +23,11 @@ afterAll(() => {
   handle.server.stop(true);
   handle.db.close();
   for (const p of [TEST_DB, TEST_SECRET]) if (existsSync(p)) unlinkSync(p);
+  if (previousWakeMode === undefined) {
+    delete process.env.AGENT_PEERS_WAKE_MODE;
+  } else {
+    process.env.AGENT_PEERS_WAKE_MODE = previousWakeMode;
+  }
 });
 
 test("broker-client end-to-end: register → send → poll → ack", async () => {
@@ -49,6 +57,43 @@ test("broker-client end-to-end: register → send → poll → ack", async () =>
   const acked = await client.ackMessages({
     id: b.id, session_token: b.session_token,
     lease_tokens: polled.map((m) => m.lease_token),
+  });
+  expect(acked.acked).toBe(1);
+});
+
+test("broker-client polls and acks host intents via shared-secret endpoints", async () => {
+  const client = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
+
+  const sender = await client.register({
+    peer_type: "claude", host: "lpreet-pco", pid: 30, cwd: "/r", git_root: null, tty: null, summary: "",
+    name: "intent-sender",
+  });
+  await client.register({
+    peer_type: "codex", host: "lpreet-pc", pid: 31, cwd: "/r", git_root: null, tty: "pts/31", summary: "",
+    name: "intent-target",
+  });
+
+  const sent = await client.sendMessage({
+    from_id: sender.id, session_token: sender.session_token, to_id_or_name: "intent-target", text: "remote wake me",
+  });
+  expect(sent.ok).toBe(true);
+
+  let intents = await client.pollHostIntents({ host_id: "lpreet-pc" });
+  for (let i = 0; intents.length === 0 && i < 20; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    intents = await client.pollHostIntents({ host_id: "lpreet-pc" });
+  }
+  expect(intents).toHaveLength(1);
+  expect(intents[0]!.type).toBe("wake");
+  expect(intents[0]!.target_name).toBe("intent-target");
+  expect(intents[0]!.lease_token).toBeTruthy();
+
+  const acked = await client.ackHostIntent({
+    id: intents[0]!.id,
+    lease_token: intents[0]!.lease_token!,
+    status: "done",
+    result: "would_wake",
+    idle_proof: "client test",
   });
   expect(acked.acked).toBe(1);
 });

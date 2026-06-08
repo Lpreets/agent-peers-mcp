@@ -40,12 +40,20 @@ test("readWakeMode defaults to off and only accepts known values", () => {
 
 test("off mode: enqueue is a no-op, mechanism never called, nothing pending", async () => {
   const wake = recordingWake();
-  const w = startWakeWorker(fakeDb, { mode: "off", getPeer: getPeer(makePeer()), wakeFn: wake.fn });
+  const remoteIntents: Peer[] = [];
+  const w = startWakeWorker(fakeDb, {
+    mode: "off",
+    hostId: "lpreet-pco",
+    getPeer: getPeer(makePeer({ host: "lpreet-pc" })),
+    wakeFn: wake.fn,
+    enqueueRemoteIntent: (peer) => { remoteIntents.push(peer); },
+  });
   w.enqueue("peer-1", "msg-1");
   w.enqueue("peer-1", "msg-2");
   await w.drainOnce();
   expect(w.pendingCount()).toBe(0);
   expect(wake.calls.length).toBe(0);
+  expect(remoteIntents).toHaveLength(0);
   w.stop();
 });
 
@@ -133,6 +141,60 @@ test("target is built from the FRESH peer row (tty/cwd/name), not the queued sna
   expect(wake.calls[0]!.tty).toBe("/dev/pts/42");
   expect(wake.calls[0]!.cwd).toBe("/repo/sub");
   expect(wake.calls[0]!.name).toBe("fresh-name");
+  w.stop();
+});
+
+test("remote host target is queued as a host intent and never calls local tmux wake", async () => {
+  let t = 0;
+  const wake = recordingWake();
+  const remoteIntents: Array<{ peer: Peer; reason_id: string }> = [];
+  const logs: WakeDecision[] = [];
+  const w = startWakeWorker(fakeDb, {
+    mode: "on",
+    hostId: "lpreet-pco",
+    getPeer: getPeer(makePeer({ host: "lpreet-pc" })),
+    wakeFn: wake.fn,
+    enqueueRemoteIntent: (peer, reason_id) => {
+      remoteIntents.push({ peer, reason_id });
+    },
+    logger: (d) => logs.push(d),
+    now: () => t,
+    quietWindowMs: 0,
+    drainMs: 1_000_000,
+  });
+  w.enqueue("peer-1", "msg-remote");
+  t += 10;
+  await w.drainOnce();
+
+  expect(wake.calls).toHaveLength(0);
+  expect(remoteIntents).toHaveLength(1);
+  expect(remoteIntents[0]!.peer.host).toBe("lpreet-pc");
+  expect(remoteIntents[0]!.reason_id).toBe("msg-remote");
+  expect(logs[0]!.result).toBe("queued_remote");
+  expect(Object.keys(logs[0]!)).not.toContain("text");
+  w.stop();
+});
+
+test("legacy null-host target stays on the local in-process wake path", async () => {
+  let t = 0;
+  const wake = recordingWake();
+  const remoteIntents: Peer[] = [];
+  const w = startWakeWorker(fakeDb, {
+    mode: "on",
+    hostId: "lpreet-pco",
+    getPeer: getPeer(makePeer({ host: null })),
+    wakeFn: wake.fn,
+    enqueueRemoteIntent: (peer) => { remoteIntents.push(peer); },
+    now: () => t,
+    quietWindowMs: 0,
+    drainMs: 1_000_000,
+  });
+  w.enqueue("peer-1", "msg-local");
+  t += 10;
+  await w.drainOnce();
+
+  expect(remoteIntents).toHaveLength(0);
+  expect(wake.calls).toHaveLength(1);
   w.stop();
 });
 

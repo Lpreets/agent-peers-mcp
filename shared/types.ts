@@ -108,6 +108,55 @@ export interface RenamePeerResponse {
   name?: PeerName;
 }
 
+// ----- Host-local executor intent queue -----
+
+export type HostIntentType = "wake" | "rotate";
+export type HostIntentStatus = "pending" | "leased" | "done" | "failed";
+
+export interface HostIntent {
+  id: number;
+  type: HostIntentType;
+  host_id: string;
+  target_peer_id: PeerId;
+  target_peer_type: PeerType;
+  target_name: PeerName;
+  target_cwd: string;
+  target_git_root: string | null;
+  target_tty: string | null;
+  reason_id: string;
+  status: HostIntentStatus;
+  attempts: number;
+  created_at: string;
+  updated_at: string;
+  leased_at: string | null;
+  lease_expires_at: string | null;
+  lease_token: string | null;
+  result: string | null;
+  idle_proof: string | null;
+}
+
+export interface PollHostIntentsRequest {
+  host_id: string;
+  limit?: number;
+}
+
+export interface PollHostIntentsResponse {
+  intents: HostIntent[];
+}
+
+export interface AckHostIntentRequest {
+  id: number;
+  lease_token: string;
+  status: "done" | "failed";
+  result: string;
+  idle_proof?: string | null;
+}
+
+export interface AckHostIntentResponse {
+  ok: boolean;
+  acked: number;
+}
+
 // ----- Idle-safe wake layer (S310 Fix 1) -----
 // Seam between the broker-daemon wake worker (Claude/zany-kiwi) and the
 // tmux wake mechanism (Codex/jolly-moose). The worker decides WHEN to attempt
@@ -119,6 +168,7 @@ export type WakeMode = "off" | "log-only" | "on";
 
 export type WakeResult =
   | "woke"
+  | "queued_remote"            // broker queued a durable host-local executor intent
   | "would_wake"               // log-only: validation passed, no keys sent
   | "would_wake_low_confidence" // log-only: tty+scope ok but missing 2nd identity signal
   | "skipped_active"           // an active marker was visible → never inject

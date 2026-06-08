@@ -69,6 +69,8 @@ export interface WakeWorkerOptions {
   getPeer: GetPeerFn;
   mode?: WakeMode;            // default: readWakeMode()
   wakeFn?: WakePeerIfIdle;    // default: the real shared/tmux-wake.ts mechanism
+  hostId?: string | null;     // when set, non-null peer.host != hostId routes to remote intent hook
+  enqueueRemoteIntent?: (peer: Peer, reason_id: string) => void | Promise<void>;
   logger?: WakeLogger;        // default: stderr
   drainMs?: number;
   quietWindowMs?: number;
@@ -172,6 +174,26 @@ export function startWakeWorker(db: Database, opts: WakeWorkerOptions): WakeWork
         reason_id: e.reason_id, mode, idle_proof: "peer row gone at wake time",
         at: new Date(now()).toISOString(),
       };
+    }
+    if (peer.host && opts.hostId && peer.host !== opts.hostId && opts.enqueueRemoteIntent) {
+      try {
+        await opts.enqueueRemoteIntent(peer, e.reason_id);
+        return {
+          peer_id: peer.id, name: peer.name, peer_type: peer.peer_type,
+          tty: peer.tty, cwd: peer.cwd, result: "queued_remote",
+          reason_id: e.reason_id, mode,
+          idle_proof: `queued host-local intent for ${peer.host}`,
+          at: new Date(now()).toISOString(),
+        };
+      } catch (err) {
+        return {
+          peer_id: peer.id, name: peer.name, peer_type: peer.peer_type,
+          tty: peer.tty, cwd: peer.cwd, result: "error",
+          reason_id: e.reason_id, mode,
+          idle_proof: `remote intent enqueue threw: ${err instanceof Error ? err.message : String(err)}`,
+          at: new Date(now()).toISOString(),
+        };
+      }
     }
     const target: WakeTarget = {
       peer_id: peer.id,
