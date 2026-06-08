@@ -36,6 +36,7 @@ afterEach(() => {
 function reg(opts: {
   name?: string;
   peer_type?: "claude" | "codex";
+  host?: string | null;
   cwd?: string;
   git_root?: string | null;
   tty?: string | null;
@@ -48,6 +49,7 @@ function reg(opts: {
     cwd: opts.cwd ?? "/x",
     git_root: opts.git_root ?? null,
     tty: opts.tty ?? null,
+    host: opts.host,
     summary: opts.summary ?? "",
     ...(opts.name ? { name: opts.name } : {}),
   });
@@ -215,6 +217,48 @@ test("registerPeer keeps distinct peers for different tty cwd or empty tty", () 
   expect(otherType.name).toBe("base-4");
 });
 
+test("registerPeer keeps same cwd tty type distinct across different hosts", () => {
+  const pco = reg({ name: "pco-peer", peer_type: "codex", host: "lpreet-pco", cwd: "/repo", tty: "pts/9" });
+  const pc = reg({ name: "pc-peer", peer_type: "codex", host: "lpreet-pc", cwd: "/repo", tty: "pts/9" });
+
+  expect(pc.id).not.toBe(pco.id);
+  const peers = listPeers(db, { scope: "machine", cwd: "/any", git_root: null, peer_type: "codex" });
+  expect(peers).toHaveLength(2);
+  expect(peers.map((p) => p.host).sort()).toEqual(["lpreet-pc", "lpreet-pco"]);
+});
+
+test("registerPeer replaces same host cwd tty type and normalizes host", () => {
+  const first = reg({ name: "stable-host", peer_type: "codex", host: "Lpreet-PCO", cwd: "/repo", tty: "pts/9", pid: 101 });
+  const second = reg({ name: "stable-host", peer_type: "codex", host: " lpreet-pco ", cwd: "/repo", tty: "pts/9", pid: 202 });
+
+  expect(second.id).toBe(first.id);
+  expect(second.name).toBe("stable-host");
+  expect(second.session_token).not.toBe(first.session_token);
+  const row = getPeer(db, second.id)!;
+  expect(row.host).toBe("lpreet-pco");
+  expect(row.pid).toBe(202);
+});
+
+test("registerPeer legacy null host dedupes as today", () => {
+  const first = reg({ name: "legacy-hostless", peer_type: "codex", host: null, cwd: "/repo", tty: "pts/9", pid: 101 });
+  const second = reg({ name: "legacy-hostless", peer_type: "codex", host: null, cwd: "/repo", tty: "pts/9", pid: 202 });
+
+  expect(second.id).toBe(first.id);
+  expect(getPeer(db, second.id)?.host).toBeNull();
+});
+
+test("registerPeer null host and populated host are distinct during transition", () => {
+  const legacy = reg({ name: "transition", peer_type: "codex", host: null, cwd: "/repo", tty: "pts/9", pid: 101 });
+  const qualified = reg({ name: "transition", peer_type: "codex", host: "lpreet-pco", cwd: "/repo", tty: "pts/9", pid: 202 });
+
+  expect(qualified.id).not.toBe(legacy.id);
+  expect(qualified.name).toBe("transition-2");
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
+    .run("2000-01-01T00:00:00.000Z", legacy.id);
+  expect(gcStalePeers(db)).toBe(1);
+  expect(listPeers(db, { scope: "machine", cwd: "/any", git_root: null, peer_type: "codex" })).toHaveLength(1);
+});
+
 test("registerPeer is atomic under simulated interleaving", () => {
   db.query(
     `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
@@ -334,6 +378,20 @@ test("listPeers NEVER returns session_token (critical auth regression)", () => {
   const byName = getPeerByName(db, "alpha");
   expect(byName).not.toBeNull();
   expect(Object.prototype.hasOwnProperty.call(byName, "session_token")).toBe(false);
+});
+
+test("host propagates through getPeer getPeerByName and listPeers without session_token leak", () => {
+  const registered = reg({ name: "hosted", host: "Lpreet-PCO", cwd: "/repo", tty: "pts/1" });
+  const byId = getPeer(db, registered.id)!;
+  const byName = getPeerByName(db, "hosted")!;
+  const listed = listPeers(db, { scope: "machine", cwd: "/any", git_root: null })[0]!;
+
+  expect(byId.host).toBe("lpreet-pco");
+  expect(byName.host).toBe("lpreet-pco");
+  expect(listed.host).toBe("lpreet-pco");
+  for (const peer of [byId, byName, listed] as unknown as Record<string, unknown>[]) {
+    expect(Object.prototype.hasOwnProperty.call(peer, "session_token")).toBe(false);
+  }
 });
 
 test("listPeers peer_type filter", () => {

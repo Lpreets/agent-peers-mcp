@@ -18,6 +18,7 @@ import type {
 } from "./shared/types.ts";
 import { generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
 import { startWakeWorker, type WakeWorker } from "./shared/wake-worker.ts";
+import { normalizeHostId } from "./shared/host-id.ts";
 
 export const DEFAULT_DB_PATH = resolve(homedir(), ".agent-peers.db");
 export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
@@ -94,6 +95,7 @@ export function initDb(path: string): Database {
       id            TEXT PRIMARY KEY,
       name          TEXT NOT NULL UNIQUE,
       peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex')),
+      host          TEXT,
       pid           INTEGER,
       cwd           TEXT,
       git_root      TEXT,
@@ -127,6 +129,7 @@ export function initDb(path: string): Database {
   // and backfill sensible defaults.
 
   migrate_peers_add_session_token(db);
+  migrate_peers_add_host(db);
 
   // Re-enforce 0600 AFTER migration + any CREATE TABLE writes — the initial
   // chmod before schema setup may have no-op'd on nonexistent sidecars, so
@@ -210,6 +213,19 @@ function migrate_peers_add_session_token(db: Database): void {
   }
 }
 
+function migrate_peers_add_host(db: Database): void {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (!columnExists(db, "peers", "host")) {
+      db.exec(`ALTER TABLE peers ADD COLUMN host TEXT`);
+    }
+    db.exec("COMMIT");
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch { /* best effort */ }
+    throw e;
+  }
+}
+
 function isSessionTokenNullable(db: Database): boolean {
   // pragma_table_info.notnull is 0 when the column is nullable, 1 when NOT NULL.
   // Alias to a non-reserved name for portability.
@@ -225,11 +241,13 @@ function rebuildPeersTableWithNotNullSessionToken(db: Database): void {
   // drop the old table, rename. All inside the outer BEGIN IMMEDIATE tx, so
   // readers/writers see either the old table or the renamed new table, never
   // an in-between state.
+  const hasHost = columnExists(db, "peers", "host");
   db.exec(`
     CREATE TABLE peers_new (
       id            TEXT PRIMARY KEY,
       name          TEXT NOT NULL UNIQUE,
       peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex')),
+      host          TEXT,
       pid           INTEGER,
       cwd           TEXT,
       git_root      TEXT,
@@ -241,8 +259,8 @@ function rebuildPeersTableWithNotNullSessionToken(db: Database): void {
     );
   `);
   db.exec(`
-    INSERT INTO peers_new (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
-    SELECT id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen
+    INSERT INTO peers_new (id, name, peer_type, host, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
+    SELECT id, name, peer_type, ${hasHost ? "host" : "NULL AS host"}, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen
     FROM peers
     WHERE session_token IS NOT NULL;
   `);
@@ -285,6 +303,7 @@ function clearUndeliveredLeasesForPeer(db: Database, id: string): void {
 export function registerPeer(db: Database, req: RegisterRequest): RegisterResponse {
   const ts = nowIso();
   const tty = normalizedTty(req.tty);
+  const host = normalizeHostId(req.host);
   // Every register (fresh or reclaim) issues a new session_token. Reclaim
   // rotates the token so the previous session's client (if it's still alive
   // elsewhere) can no longer act as this peer — the token is the session
@@ -296,20 +315,20 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
   // heartbeating, preserving id/name and inbox continuity while rotating the
   // session_token so old-child mutations no-op.
   if (tty) {
-    const row = db.query<{ id: string; name: string }, [string, string | null, string]>(
+    const row = db.query<{ id: string; name: string }, [string, string | null, string, string]>(
       `SELECT id, name FROM peers
-       WHERE peer_type = ? AND cwd IS ? AND tty = ?
+       WHERE peer_type = ? AND host IS ? AND cwd IS ? AND tty = ?
        ORDER BY last_seen DESC
        LIMIT 1`
-    ).get(req.peer_type, req.cwd, tty);
+    ).get(req.peer_type, host, req.cwd, tty);
     if (row) {
       db.query(
         `UPDATE peers
-           SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
+           SET peer_type = ?, host = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
                session_token = ?, last_seen = ?
          WHERE id = ?`
       ).run(
-        req.peer_type, req.pid, req.cwd, req.git_root, tty, req.summary,
+        req.peer_type, host, req.pid, req.cwd, req.git_root, tty, req.summary,
         session_token, ts, row.id,
       );
       clearUndeliveredLeasesForPeer(db, row.id);
@@ -322,11 +341,11 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
     const cutoff = new Date(Date.now() - STALE_RECLAIM_THRESHOLD_MS).toISOString();
     const reclaim = db.query(
       `UPDATE peers
-         SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
+         SET peer_type = ?, host = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
              session_token = ?, last_seen = ?
       WHERE name = ? AND last_seen < ?`
     ).run(
-      req.peer_type, req.pid, req.cwd, req.git_root, tty, req.summary,
+      req.peer_type, host, req.pid, req.cwd, req.git_root, tty, req.summary,
       session_token, ts, req.name, cutoff,
     );
     if ((reclaim.changes ?? 0) > 0) {
@@ -349,13 +368,13 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
   // Fresh INSERT with suffix ladder.
   const id = randomUUID();
   const insert = db.query(
-    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO peers (id, name, peer_type, host, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   for (const candidate of nameCandidates(req.name)) {
     try {
       insert.run(
-        id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, tty, req.summary,
+        id, candidate, req.peer_type, host, req.pid, req.cwd, req.git_root, tty, req.summary,
         session_token, ts, ts,
       );
       return { id, name: candidate, session_token };
@@ -399,7 +418,7 @@ export function setPeerSummary(db: Database, id: string, session_token: string, 
 // back to a client. authPeer() is the only code path that touches
 // session_token, and it does its own narrow query.
 const PEER_COLS =
-  "id, name, peer_type, pid, cwd, git_root, tty, summary, registered_at, last_seen";
+  "id, name, peer_type, host, pid, cwd, git_root, tty, summary, registered_at, last_seen";
 
 export function getPeer(db: Database, id: string): Peer | null {
   const row = db.query<Peer, [string]>(`SELECT ${PEER_COLS} FROM peers WHERE id = ?`).get(id);
@@ -457,7 +476,7 @@ export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
   // `session_token` out of every client-facing payload.
   const where = `WHERE ${clauses.join(" AND ")}`;
   const sql = `SELECT id, name, peer_type, pid, cwd, git_root, tty, summary,
-                      registered_at, last_seen
+                      host, registered_at, last_seen
                FROM peers ${where} ORDER BY last_seen DESC`;
   return db.query<Peer, typeof params>(sql).all(...params);
 }
