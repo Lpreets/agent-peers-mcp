@@ -19,6 +19,13 @@ import type {
 import { generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
 import { startWakeWorker, type WakeWorker } from "./shared/wake-worker.ts";
 import { normalizeHostId } from "./shared/host-id.ts";
+import { resolveHostId } from "./shared/host-id.ts";
+import {
+  ackHostIntent,
+  enqueueRemoteWakeIntent,
+  migrate_create_host_intents,
+  pollHostIntents,
+} from "./shared/host-intents.ts";
 
 export const DEFAULT_DB_PATH = resolve(homedir(), ".agent-peers.db");
 export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
@@ -130,6 +137,7 @@ export function initDb(path: string): Database {
 
   migrate_peers_add_session_token(db);
   migrate_peers_add_host(db);
+  migrate_create_host_intents(db);
 
   // Re-enforce 0600 AFTER migration + any CREATE TABLE writes — the initial
   // chmod before schema setup may have no-op'd on nonexistent sidecars, so
@@ -903,7 +911,12 @@ export function startBroker(
   // S310 Fix 1 — idle-safe wake worker. Inert unless AGENT_PEERS_WAKE_MODE is
   // log-only|on (default off → no-op enqueue). Decoupled from delivery: a wake
   // failure can never roll back or delay a committed message.
-  const wakeWorker: WakeWorker = startWakeWorker(db, { getPeer });
+  const brokerHostId = resolveHostId();
+  const wakeWorker: WakeWorker = startWakeWorker(db, {
+    getPeer,
+    hostId: brokerHostId,
+    enqueueRemoteIntent: (peer, reason_id) => enqueueRemoteWakeIntent(db, peer, reason_id),
+  });
 
   const server = Bun.serve({
     port,
@@ -941,6 +954,8 @@ export function startBroker(
           }
           case "/poll-messages": { const b = await readJson<{ id: string; session_token: string }>(req); return json({ messages: pollMessages(db, b.id, b.session_token) }); }
           case "/ack-messages":  return json(ackMessages(db, await readJson(req)));
+          case "/poll-intents":   return json({ intents: pollHostIntents(db, await readJson(req)) });
+          case "/ack-intent":     return json(ackHostIntent(db, await readJson(req)));
           case "/rename-peer":   return json(renamePeer(db, await readJson(req)));
           // No /admin/rename-peer over HTTP — arbitrary local processes could
           // hijack any peer's name. cli.ts 'rename' reads the target peer's

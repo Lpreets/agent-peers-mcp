@@ -6,7 +6,7 @@ import type {
   SendMessageRequest, SendMessageResponse, AckMessagesRequest, AckMessagesResponse,
   RenamePeerRequest, RenamePeerResponse,
   HeartbeatRequest, UnregisterRequest, PollMessagesRequest,
-  LeasedMessage, Peer,
+  LeasedMessage, Peer, PollHostIntentsRequest, HostIntent, AckHostIntentRequest, AckHostIntentResponse,
 } from "./types.ts";
 
 export interface BrokerClient {
@@ -19,6 +19,8 @@ export interface BrokerClient {
   sendMessage(req: SendMessageRequest): Promise<SendMessageResponse>;
   pollMessages(req: PollMessagesRequest): Promise<LeasedMessage[]>;
   ackMessages(req: AckMessagesRequest): Promise<AckMessagesResponse>;
+  pollHostIntents(req: PollHostIntentsRequest): Promise<HostIntent[]>;
+  ackHostIntent(req: AckHostIntentRequest): Promise<AckHostIntentResponse>;
   renamePeer(req: RenamePeerRequest): Promise<RenamePeerResponse>;
   // Note: there is no adminRenamePeer() in the client anymore. cli.ts reads
   // the target peer's session_token from SQLite directly and calls renamePeer
@@ -171,6 +173,11 @@ export function createClient(baseUrl: string, sharedSecret: string, options: Bro
       return messages;
     },
     ackMessages(req) { return post<AckMessagesResponse>("/ack-messages", req); },
+    async pollHostIntents(req) {
+      const { intents } = await post<{ intents: HostIntent[] }>("/poll-intents", req);
+      return intents;
+    },
+    ackHostIntent(req) { return post<AckHostIntentResponse>("/ack-intent", req); },
     renamePeer(req) { return post<RenamePeerResponse>("/rename-peer", req); },
   };
 }
