@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { __setTmuxWakeAdapterForTest, wakePeerIfIdle } from "../shared/tmux-wake.ts";
 import type { WakeTarget } from "../shared/types.ts";
 
@@ -56,36 +57,30 @@ afterEach(() => {
   __setTmuxWakeAdapterForTest(null);
 });
 
-const CODEX_IDLE = "› Summarize recent commits\n\ngpt-5.5 low · 0.137.0 · Context 100%…";
-const CLAUDE_2168_IDLE = `
- ▐▛███▜▌   Claude Code v2.1.168
-▝▜█████▛▘  Opus 4.8 · ~/Projects/MSAASA
-  ▘▘ ▝▝    0 awaiting input · 0 working · 12 completed
+function fixture(name: string): string {
+  return readFileSync(new URL(`./fixtures/idle-active/${name}`, import.meta.url), "utf8");
+}
 
-Completed
-✻ python print script            Printed 140 numbered lines (1–140) via a …  10s
-∙ server:agent-peers             starting…                                    5s
-… 8 more
-
-────────────────────────────────────────────────────────────────────────────────
-❯ describe a task for a new session
-────────────────────────────────────────────────────────────────────────────────
-  enter to open · space to reply · ctrl+x to delete · ? for shortcuts`;
-const CLAUDE_2168_ACTIVE = `
- ▐▛███▜▌   Claude Code v2.1.168
-▝▜█████▛▘  Opus 4.8 · ~/Projects/MSAASA
-  ▘▘ ▝▝    0 awaiting input · 1 working · 10 completed
-
-Working
-* Run a harmless…                Bash sleep 60                                7s
-
-Completed
-✻ shell command execution        sleep 60 finished successfully               1m
-
-────────────────────────────────────────────────────────────────────────────────
-❯ describe a task for a new session
-────────────────────────────────────────────────────────────────────────────────
-  enter to open · space to reply · ctrl+x to delete · ? for shortcuts`;
+const CODEX_IDLE = fixture("codex-0.137-idle.txt");
+const CODEX_ACTIVE = fixture("codex-0.137-active.txt");
+const CLAUDE_2170_IDLE = fixture("claude-2.1.170-idle.txt");
+const CLAUDE_2170_ACTIVE = fixture("claude-2.1.170-active.txt");
+const CONTAMINATED_HISTORY_WITH_IDLE_FOOTER = `
+Bash(ls) Running...
+esc to interrupt
+old transcript that must not mark the current pane active
+history filler 01
+history filler 02
+history filler 03
+history filler 04
+history filler 05
+history filler 06
+history filler 07
+history filler 08
+history filler 09
+❯
+Opus 4.8 Low · v2.1.170 · Context 51% Left · 5h 100% 7d 97% · 407 in 2 out · MSAASA master
+⏵⏵ bypass permissions on (shift+tab to cycle)`;
 
 test("off mode does not inspect tmux or send keys", async () => {
   const { sent, literals } = installFakeTmux({
@@ -125,7 +120,7 @@ test("on mode sends content-free Codex F4 plus fixed prompt and delayed Enter", 
 test("on mode sends fixed prompt only for Claude", async () => {
   const { sent, literals } = installFakeTmux({
     panes: [{ tty: "pts/4", pane_id: "%4", command: "claude", cwd: "/repo", title: "peer:zany-claude" }],
-    captures: [CLAUDE_2168_IDLE, CLAUDE_2168_IDLE, CLAUDE_2168_IDLE],
+    captures: [CLAUDE_2170_IDLE, CLAUDE_2170_IDLE, CLAUDE_2170_IDLE],
   });
   const res = await wakePeerIfIdle(target({
     peer_type: "claude",
@@ -137,10 +132,10 @@ test("on mode sends fixed prompt only for Claude", async () => {
   expect(literals).toEqual(["Check agent-peers now."]);
 });
 
-test("Claude 2.1.168 idle status line is accepted, but active working state is not", async () => {
+test("Claude 2.1.170 structural idle footer is accepted, but active spinner is not", async () => {
   const { sent: idleSent, literals: idleLiterals } = installFakeTmux({
     panes: [{ tty: "pts/4", pane_id: "%4", command: "claude", cwd: "/repo", title: "peer:zany-claude" }],
-    captures: [CLAUDE_2168_IDLE, CLAUDE_2168_IDLE],
+    captures: [CLAUDE_2170_IDLE, CLAUDE_2170_IDLE],
   });
   const idle = await wakePeerIfIdle(target({
     peer_type: "claude",
@@ -154,7 +149,7 @@ test("Claude 2.1.168 idle status line is accepted, but active working state is n
 
   const { sent: activeSent, literals: activeLiterals } = installFakeTmux({
     panes: [{ tty: "pts/4", pane_id: "%4", command: "claude", cwd: "/repo", title: "peer:zany-claude" }],
-    captures: [CLAUDE_2168_ACTIVE, CLAUDE_2168_ACTIVE],
+    captures: [CLAUDE_2170_ACTIVE, CLAUDE_2170_ACTIVE],
   });
   const active = await wakePeerIfIdle(target({
     peer_type: "claude",
@@ -164,6 +159,19 @@ test("Claude 2.1.168 idle status line is accepted, but active working state is n
   expect(active.result).toBe("skipped_not_idle");
   expect(activeSent).toEqual([]);
   expect(activeLiterals).toEqual([]);
+});
+
+test("old active transcript above the bottom band does not contaminate current idle proof", async () => {
+  installFakeTmux({
+    panes: [{ tty: "pts/4", pane_id: "%4", command: "claude", cwd: "/repo", title: "peer:zany-claude" }],
+    captures: [CONTAMINATED_HISTORY_WITH_IDLE_FOOTER, CONTAMINATED_HISTORY_WITH_IDLE_FOOTER],
+  });
+  const res = await wakePeerIfIdle(target({
+    peer_type: "claude",
+    name: "zany-claude",
+    tty: "pts/4",
+  }), "log-only");
+  expect(res.result).toBe("would_wake");
 });
 
 test("TOCTOU recheck skips if pane becomes active after idle proof but before nudge", async () => {
@@ -181,7 +189,7 @@ test("TOCTOU recheck skips if pane becomes active after idle proof but before nu
 test("active marker skips and injects no keys", async () => {
   const { sent, literals } = installFakeTmux({
     panes: [{ tty: "pts/9", pane_id: "%1", command: "codex", cwd: "/repo", title: "peer:zesty-codex" }],
-    captures: ["Bash(ls) Running...\nesc to interrupt", CODEX_IDLE],
+    captures: [CODEX_ACTIVE, CODEX_IDLE],
   });
   const res = await wakePeerIfIdle(target(), "on");
   expect(res.result).toBe("skipped_not_idle");

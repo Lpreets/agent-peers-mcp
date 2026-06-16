@@ -17,12 +17,15 @@ type TmuxWakeAdapter = {
   sleep(ms: number): Promise<void>;
 };
 
-const ACTIVE_MARKERS =
-  /esc to interrupt|Working \(|tool_use|Bash\(|Running|Thinking|Messages to be submitted|Do you want to/i;
 const CODEX_EXTRA_ACTIVE = /Update available|Update now|new Codex version|Hooks need review/i;
-const CLAUDE_IDLE = /0 awaiting input[^\n]{1,8}\b0 working\b/;
-const CODEX_IDLE = /gpt-5[\s\S]*Context [0-9]+%( [Ll]eft)?/;
+const CLAUDE_ACTIVE_MARKERS = /(^[●✻]\s+\S+ing…|⎿\s+Running…|esc to interrupt)/m;
+const CODEX_ACTIVE_MARKERS = /(Working \(|esc to interrupt)/;
+const CLAUDE_IDLE_FOOTER = /Opus .* · v2\.1\.[0-9]+ · Context [0-9]+%/;
+const CLAUDE_BYPASS_FOOTER = /bypass permissions on/;
+const CODEX_IDLE_FOOTER = /gpt-5\.[0-9a-z-]* .* · 0\.13[0-9]\.[0-9]+ · Context [0-9]+%( [Ll]eft)?/;
+const CODEX_PROMPT_BAND = /(^|\n)[›❯]/;
 const WAKE_TEXT = "Check agent-peers now.";
+type PaneActivity = "active" | "idle" | "unknown";
 
 function normalizeTty(tty: string | null): string | null {
   if (!tty) return null;
@@ -102,32 +105,41 @@ function isHighConfidenceIdentity(pane: PaneInfo, target: WakeTarget): boolean {
   return pane.title === `peer:${target.name}`;
 }
 
-function hasActiveMarker(text: string, peerType: WakeTarget["peer_type"]): boolean {
-  if (ACTIVE_MARKERS.test(text)) return true;
-  return peerType === "codex" && CODEX_EXTRA_ACTIVE.test(text);
+function bottomBand(text: string): string {
+  const lines = text.split(/\r?\n/).map((line) => line.trimEnd()).filter((line) => line.trim() !== "");
+  return lines.slice(-10).join("\n");
 }
 
-function hasIdleMarker(text: string, peerType: WakeTarget["peer_type"]): boolean {
-  return peerType === "codex" ? CODEX_IDLE.test(text) : CLAUDE_IDLE.test(text);
+function classifyPaneActivity(text: string, peerType: WakeTarget["peer_type"]): PaneActivity {
+  const band = bottomBand(text);
+  if (peerType === "codex") {
+    if (CODEX_ACTIVE_MARKERS.test(band) || CODEX_EXTRA_ACTIVE.test(band)) return "active";
+    if (CODEX_IDLE_FOOTER.test(band) && CODEX_PROMPT_BAND.test(band)) return "idle";
+    return "unknown";
+  }
+
+  if (CLAUDE_ACTIVE_MARKERS.test(band)) return "active";
+  if (CLAUDE_IDLE_FOOTER.test(band) && CLAUDE_BYPASS_FOOTER.test(band)) return "idle";
+  return "unknown";
 }
 
 function summarizeIdleProof(text: string, peerType: WakeTarget["peer_type"]): string {
-  const context = text.match(/Context [0-9]+%( [Ll]eft)?/)?.[0] ?? "Context unknown";
+  const context = bottomBand(text).match(/Context [0-9]+%( [Ll]eft)?/)?.[0] ?? "Context unknown";
   return `2 stable ${peerType} idle samples; footer=${context}`;
 }
 
 async function twoSampleIdleProof(paneId: string, peerType: WakeTarget["peer_type"]): Promise<string | null> {
   const first = await adapter.capturePane(paneId);
-  if (hasActiveMarker(first, peerType) || !hasIdleMarker(first, peerType)) return null;
+  if (classifyPaneActivity(first, peerType) !== "idle") return null;
   await adapter.sleep(1000);
   const second = await adapter.capturePane(paneId);
-  if (hasActiveMarker(second, peerType) || !hasIdleMarker(second, peerType)) return null;
+  if (classifyPaneActivity(second, peerType) !== "idle") return null;
   return summarizeIdleProof(second, peerType);
 }
 
 async function nudge(paneId: string, peerType: WakeTarget["peer_type"]): Promise<boolean> {
   const latest = await adapter.capturePane(paneId);
-  if (hasActiveMarker(latest, peerType) || !hasIdleMarker(latest, peerType)) return false;
+  if (classifyPaneActivity(latest, peerType) !== "idle") return false;
   if (peerType === "codex") {
     try {
       await adapter.sendKeys(paneId, "F4");
