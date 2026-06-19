@@ -65,6 +65,7 @@ const CODEX_IDLE = fixture("codex-0.137-idle.txt");
 const CODEX_ACTIVE = fixture("codex-0.137-active.txt");
 const CLAUDE_2170_IDLE = fixture("claude-2.1.170-idle.txt");
 const CLAUDE_2170_ACTIVE = fixture("claude-2.1.170-active.txt");
+const CLAUDE_2173_AUTO_IDLE = fixture("claude-2.1.173-auto-idle.txt");
 const CONTAMINATED_HISTORY_WITH_IDLE_FOOTER = `
 Bash(ls) Running...
 esc to interrupt
@@ -79,7 +80,7 @@ history filler 07
 history filler 08
 history filler 09
 ❯
-Opus 4.8 Low · v2.1.170 · Context 51% Left · 5h 100% 7d 97% · 407 in 2 out · MSAASA master
+Opus 4.8 Low  ·  v2.1.170  ·  Context 51% Left  ·  5h 100% 7d 97%  ·  407 in 2 out  ·  MSAASA master
 ⏵⏵ bypass permissions on (shift+tab to cycle)`;
 
 test("off mode does not inspect tmux or send keys", async () => {
@@ -172,6 +173,22 @@ test("old active transcript above the bottom band does not contaminate current i
     tty: "pts/4",
   }), "log-only");
   expect(res.result).toBe("would_wake");
+});
+
+test("Claude auto-mode idle footer is accepted", async () => {
+  const { sent, literals } = installFakeTmux({
+    panes: [{ tty: "pts/4", pane_id: "%4", command: "claude", cwd: "/repo", title: "peer:zany-claude" }],
+    captures: [CLAUDE_2173_AUTO_IDLE, CLAUDE_2173_AUTO_IDLE],
+  });
+  const res = await wakePeerIfIdle(target({
+    peer_type: "claude",
+    name: "zany-claude",
+    tty: "pts/4",
+  }), "log-only");
+  expect(res.result).toBe("would_wake");
+  expect(res.idle_proof).toContain("2 stable claude idle samples");
+  expect(sent).toEqual([]);
+  expect(literals).toEqual([]);
 });
 
 test("TOCTOU recheck skips if pane becomes active after idle proof but before nudge", async () => {

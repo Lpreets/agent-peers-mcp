@@ -20,8 +20,8 @@ type TmuxWakeAdapter = {
 const CODEX_EXTRA_ACTIVE = /Update available|Update now|new Codex version|Hooks need review/i;
 const CLAUDE_ACTIVE_MARKERS = /(^[●✻]\s+\S+ing…|⎿\s+Running…|esc to interrupt)/m;
 const CODEX_ACTIVE_MARKERS = /(Working \(|esc to interrupt)/;
-const CLAUDE_IDLE_FOOTER = /Opus .* · v2\.1\.[0-9]+ · Context [0-9]+%/;
-const CLAUDE_BYPASS_FOOTER = /bypass permissions on/;
+const CLAUDE_IDLE_FOOTER = /Opus .*\s+·\s+v2\.1\.[0-9]+\s+·\s+Context [0-9]+%/;
+const CLAUDE_PERMISSION_FOOTER = /(bypass permissions on|auto mode on)/;
 const CODEX_IDLE_FOOTER = /gpt-5\.[0-9a-z-]* .* · 0\.13[0-9]\.[0-9]+ · Context [0-9]+%( [Ll]eft)?/;
 const CODEX_PROMPT_BAND = /(^|\n)[›❯]/;
 const WAKE_TEXT = "Check agent-peers now.";
@@ -119,7 +119,7 @@ function classifyPaneActivity(text: string, peerType: WakeTarget["peer_type"]): 
   }
 
   if (CLAUDE_ACTIVE_MARKERS.test(band)) return "active";
-  if (CLAUDE_IDLE_FOOTER.test(band) && CLAUDE_BYPASS_FOOTER.test(band)) return "idle";
+  if (CLAUDE_IDLE_FOOTER.test(band) && CLAUDE_PERMISSION_FOOTER.test(band)) return "idle";
   return "unknown";
 }
 
