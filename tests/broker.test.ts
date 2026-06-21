@@ -452,6 +452,85 @@ test("sendMessage with WRONG session_token for real from_id is rejected (auth)",
   expect(res.error).toMatch(/unauthorized/i);
 });
 
+test("sendMessage allows refresh guard precheck target to reply after same-tty token rotation", () => {
+  const guard = reg({
+    name: "refresh-msaasa",
+    peer_type: "codex",
+    cwd: "/repo",
+    summary: "refresh-pair dispatcher guard for MSAASA test",
+  });
+  const target = reg({
+    name: "target-codex",
+    peer_type: "codex",
+    cwd: "/repo",
+    tty: "pts/9",
+    pid: 101,
+  });
+  const precheck = sendMessage(db, {
+    from_id: guard.id,
+    session_token: guard.session_token,
+    to_id_or_name: target.name,
+    text: "ADDR refresh-pair precheck test: reply ROTATION_OK",
+  });
+  expect(precheck.ok).toBe(true);
+
+  const replacement = reg({
+    name: "target-codex",
+    peer_type: "codex",
+    cwd: "/repo",
+    tty: "pts/9",
+    pid: 202,
+  });
+  expect(replacement.id).toBe(target.id);
+  expect(replacement.session_token).not.toBe(target.session_token);
+
+  const directStale = sendMessage(db, {
+    from_id: target.id,
+    session_token: target.session_token,
+    to_id_or_name: "beta",
+    text: "not authorized",
+  });
+  expect(directStale.ok).toBe(false);
+  expect(directStale.error).toMatch(/unauthorized/i);
+
+  const reply = sendMessage(db, {
+    from_id: target.id,
+    session_token: target.session_token,
+    to_id_or_name: guard.id,
+    text: "ROTATION_OK test",
+  });
+  expect(reply.ok).toBe(true);
+  const guardInbox = pollMessages(db, guard.id, guard.session_token);
+  expect(guardInbox.some((m) => m.text === "ROTATION_OK test")).toBe(true);
+  expect(guardInbox.every((m) => m.to_id === guard.id)).toBe(true);
+});
+
+test("sendMessage refresh guard reply exception is scoped to the precheck target", () => {
+  const guard = reg({
+    name: "refresh-msaasa",
+    peer_type: "codex",
+    cwd: "/repo",
+    summary: "refresh-pair dispatcher guard for MSAASA test",
+  });
+  const target = reg({ name: "target-codex", peer_type: "codex", cwd: "/repo", tty: "pts/9" });
+  const outsider = reg({ name: "outsider", peer_type: "codex", cwd: "/repo", tty: "pts/10" });
+  expect(sendMessage(db, {
+    from_id: guard.id,
+    session_token: guard.session_token,
+    to_id_or_name: target.name,
+    text: "ADDR refresh-pair precheck test: reply ROTATION_OK",
+  }).ok).toBe(true);
+
+  const forged = sendMessage(db, {
+    from_id: outsider.id,
+    session_token: "wrong-token",
+    to_id_or_name: guard.id,
+    text: "ROTATION_OK forged",
+  });
+  expect(forged.ok).toBe(false);
+  expect(forged.error).toMatch(/unauthorized/i);
+});
+
 test("sendMessage with stale sender is rejected", () => {
   const a = reg({ name: "alpha" });
   const b = reg({ name: "beta" });
@@ -509,11 +588,15 @@ test("pollMessages returns leased messages with enriched fields", () => {
   expect(out[0]!.lease_token).toMatch(/^[a-f0-9-]{36}$/);
 });
 
-test("pollMessages twice does not re-deliver while lease active", () => {
+test("pollMessages twice re-delivers to same recipient while lease active", () => {
   const { a, b } = pair();
   sendMessage(db, { from_id: a.id, session_token: a.session_token, to_id_or_name: "beta", text: "once" });
-  expect(pollMessages(db, b.id, b.session_token).length).toBe(1);
-  expect(pollMessages(db, b.id, b.session_token).length).toBe(0);
+  const first = pollMessages(db, b.id, b.session_token);
+  expect(first.length).toBe(1);
+  const second = pollMessages(db, b.id, b.session_token);
+  expect(second.length).toBe(1);
+  expect(second[0]!.id).toBe(first[0]!.id);
+  expect(second[0]!.lease_token).not.toBe(first[0]!.lease_token);
 });
 
 test("pollMessages re-delivers after lease expiry", () => {

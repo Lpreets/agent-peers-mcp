@@ -502,6 +502,31 @@ function resolveTarget(db: Database, to_id_or_name: string): Peer | null {
   return getPeerByName(db, to_id_or_name);
 }
 
+function isRefreshGuardReplyAuthorized(
+  db: Database,
+  from_id: string,
+  to_id_or_name: string,
+  staleCutoff: string,
+): boolean {
+  const guard = db.query<{ id: string; name: string; summary: string }, [string, string, string]>(
+    `SELECT id, name, summary FROM peers
+     WHERE (id = ? OR name = ?)
+       AND last_seen >= ?`
+  ).get(to_id_or_name, to_id_or_name, staleCutoff);
+  if (!guard) return false;
+  if (!guard.name.startsWith("refresh-")) return false;
+  if (!guard.summary.startsWith("refresh-pair dispatcher guard ")) return false;
+
+  const precheck = db.query<{ id: number }, [string, string]>(
+    `SELECT id FROM messages
+     WHERE from_id = ? AND to_id = ?
+       AND text LIKE 'ADDR refresh-pair precheck %'
+     ORDER BY id DESC
+     LIMIT 1`
+  ).get(guard.id, from_id);
+  return !!precheck;
+}
+
 export function sendMessage(db: Database, req: SendMessageRequest): SendMessageResponse {
   // Atomic sender auth + target resolution + liveness check + insert, all in
   // a single transaction so nothing can unregister or re-register between
@@ -515,12 +540,19 @@ export function sendMessage(db: Database, req: SendMessageRequest): SendMessageR
       "SELECT name FROM peers WHERE id = ? AND session_token = ? AND last_seen >= ?"
     ).get(req.from_id, req.session_token, staleCutoff);
     if (!sender) {
-      // Distinguish unauthorized vs stale for a better error message.
-      const row = db.query<{ last_seen: string; name: string }, [string, string]>(
-        "SELECT last_seen, name FROM peers WHERE id = ? AND session_token = ?"
-      ).get(req.from_id, req.session_token);
-      if (!row) return { ok: false, error: `unauthorized sender: ${req.from_id}` };
-      return { ok: false, error: `sender stale: ${row.name}` };
+      // A refresh-pair guard explicitly addressed this peer and is waiting
+      // for a ROTATION_OK/BLOCK reply. Permit that narrow reply even if the
+      // target's session_token was rotated by same-tty registration
+      // replacement after the precheck was delivered.
+      const refreshGuardReply = isRefreshGuardReplyAuthorized(db, req.from_id, req.to_id_or_name, staleCutoff);
+      if (!refreshGuardReply) {
+        // Distinguish unauthorized vs stale for a better error message.
+        const row = db.query<{ last_seen: string; name: string }, [string, string]>(
+          "SELECT last_seen, name FROM peers WHERE id = ? AND session_token = ?"
+        ).get(req.from_id, req.session_token);
+        if (!row) return { ok: false, error: `unauthorized sender: ${req.from_id}` };
+        return { ok: false, error: `sender stale: ${row.name}` };
+      }
     }
 
     // 2. Target resolution + liveness + insert in ONE statement. The insert
@@ -580,9 +612,8 @@ export function pollMessages(db: Database, id: string, session_token: string): L
       `SELECT id, from_id, to_id, text, sent_at
        FROM messages
        WHERE to_id = ? AND acked = 0
-         AND (lease_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at < ?)
        ORDER BY id ASC`
-    ).all(id, nowStr);
+    ).all(id);
 
     const result: LeasedMessage[] = [];
     for (const row of rows) {
