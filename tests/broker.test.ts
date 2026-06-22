@@ -470,7 +470,7 @@ test("sendMessage allows refresh guard precheck target to reply after same-tty t
     from_id: guard.id,
     session_token: guard.session_token,
     to_id_or_name: target.name,
-    text: "ADDR refresh-pair precheck test: reply ROTATION_OK",
+    text: "ADDR refresh-pair precheck test: reply ROTATION_OK ROTATION-test-generation",
   });
   expect(precheck.ok).toBe(true);
 
@@ -497,12 +497,70 @@ test("sendMessage allows refresh guard precheck target to reply after same-tty t
     from_id: target.id,
     session_token: target.session_token,
     to_id_or_name: guard.id,
-    text: "ROTATION_OK test",
+    text: "ROTATION_OK ROTATION-test-generation",
   });
   expect(reply.ok).toBe(true);
   const guardInbox = pollMessages(db, guard.id, guard.session_token);
-  expect(guardInbox.some((m) => m.text === "ROTATION_OK test")).toBe(true);
+  expect(guardInbox.some((m) => m.text === "ROTATION_OK ROTATION-test-generation")).toBe(true);
   expect(guardInbox.every((m) => m.to_id === guard.id)).toBe(true);
+});
+
+test("sendMessage refresh guard stale-token exception requires the precheck nonce", () => {
+  const guard = reg({
+    name: "refresh-msaasa",
+    peer_type: "codex",
+    cwd: "/repo",
+    summary: "refresh-pair dispatcher guard for MSAASA test",
+  });
+  const target = reg({
+    name: "target-codex",
+    peer_type: "codex",
+    cwd: "/repo",
+    tty: "pts/9",
+    pid: 101,
+  });
+  expect(sendMessage(db, {
+    from_id: guard.id,
+    session_token: guard.session_token,
+    to_id_or_name: target.name,
+    text: "ADDR refresh-pair precheck test: reply ROTATION_OK ROTATION-good-nonce",
+  }).ok).toBe(true);
+
+  const replacement = reg({
+    name: "target-codex",
+    peer_type: "codex",
+    cwd: "/repo",
+    tty: "pts/9",
+    pid: 202,
+  });
+  expect(replacement.id).toBe(target.id);
+  expect(replacement.session_token).not.toBe(target.session_token);
+
+  const wrongNonce = sendMessage(db, {
+    from_id: target.id,
+    session_token: target.session_token,
+    to_id_or_name: guard.id,
+    text: "ROTATION_OK ROTATION-wrong-nonce",
+  });
+  expect(wrongNonce.ok).toBe(false);
+  expect(wrongNonce.error).toMatch(/unauthorized/i);
+
+  const freeform = sendMessage(db, {
+    from_id: target.id,
+    session_token: target.session_token,
+    to_id_or_name: guard.id,
+    text: "ROTATION_OK",
+  });
+  expect(freeform.ok).toBe(false);
+  expect(freeform.error).toMatch(/unauthorized/i);
+
+  const block = sendMessage(db, {
+    from_id: target.id,
+    session_token: target.session_token,
+    to_id_or_name: guard.id,
+    text: "ROTATION_BLOCK ROTATION-good-nonce: shell still running",
+  });
+  expect(block.ok).toBe(true);
 });
 
 test("sendMessage refresh guard reply exception is scoped to the precheck target", () => {
@@ -518,7 +576,7 @@ test("sendMessage refresh guard reply exception is scoped to the precheck target
     from_id: guard.id,
     session_token: guard.session_token,
     to_id_or_name: target.name,
-    text: "ADDR refresh-pair precheck test: reply ROTATION_OK",
+    text: "ADDR refresh-pair precheck test: reply ROTATION_OK ROTATION-scoped",
   }).ok).toBe(true);
 
   const forged = sendMessage(db, {

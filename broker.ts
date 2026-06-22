@@ -506,6 +506,7 @@ function isRefreshGuardReplyAuthorized(
   db: Database,
   from_id: string,
   to_id_or_name: string,
+  text: string,
   staleCutoff: string,
 ): boolean {
   const guard = db.query<{ id: string; name: string; summary: string }, [string, string, string]>(
@@ -517,14 +518,19 @@ function isRefreshGuardReplyAuthorized(
   if (!guard.name.startsWith("refresh-")) return false;
   if (!guard.summary.startsWith("refresh-pair dispatcher guard ")) return false;
 
-  const precheck = db.query<{ id: number }, [string, string]>(
-    `SELECT id FROM messages
+  const precheck = db.query<{ text: string }, [string, string]>(
+    `SELECT text FROM messages
      WHERE from_id = ? AND to_id = ?
        AND text LIKE 'ADDR refresh-pair precheck %'
      ORDER BY id DESC
      LIMIT 1`
   ).get(guard.id, from_id);
-  return !!precheck;
+  if (!precheck) return false;
+
+  const nonce = precheck.text.match(/\bROTATION-[A-Za-z0-9_.:-]+\b/)?.[0];
+  if (!nonce) return false;
+  const escaped = nonce.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^(?:ROTATION_OK ${escaped}|ROTATION_BLOCK ${escaped}(?:: .+)?)$`).test(text);
 }
 
 export function sendMessage(db: Database, req: SendMessageRequest): SendMessageResponse {
@@ -544,7 +550,7 @@ export function sendMessage(db: Database, req: SendMessageRequest): SendMessageR
       // for a ROTATION_OK/BLOCK reply. Permit that narrow reply even if the
       // target's session_token was rotated by same-tty registration
       // replacement after the precheck was delivered.
-      const refreshGuardReply = isRefreshGuardReplyAuthorized(db, req.from_id, req.to_id_or_name, staleCutoff);
+      const refreshGuardReply = isRefreshGuardReplyAuthorized(db, req.from_id, req.to_id_or_name, req.text, staleCutoff);
       if (!refreshGuardReply) {
         // Distinguish unauthorized vs stale for a better error message.
         const row = db.query<{ last_seen: string; name: string }, [string, string]>(
