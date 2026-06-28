@@ -136,4 +136,3 @@ test("completed wake intents no longer occupy the active coalescing slot", () =>
   const second = enqueueHostIntent(db, { type: "wake", host_id: "lpreet-pc", target_peer_id: target.id, reason_id: "msg-2" });
   expect(second.id).not.toBe(first.id);
 });
-

@@ -80,4 +80,3 @@ test("processHostIntent stubs rotate intents as failed not-implemented in Phase 
     idle_proof: "rotate intents are reserved for Phase 3",
   }]);
 });
-
