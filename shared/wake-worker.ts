@@ -40,6 +40,10 @@ export function readWakeMode(env: Record<string, string | undefined> = process.e
   return v === "on" || v === "log-only" ? (v as WakeMode) : "off";
 }
 
+export function readWakeClaude(env: Record<string, string | undefined> = process.env): "off" | "on" {
+  return (env.AGENT_PEERS_WAKE_CLAUDE ?? "off").trim().toLowerCase() === "on" ? "on" : "off";
+}
+
 interface QueueEntry {
   peer_id: PeerId;
   firstQueuedAt: number;

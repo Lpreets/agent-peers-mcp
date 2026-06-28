@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import { __setTmuxWakeAdapterForTest, wakePeerIfIdle } from "../shared/tmux-wake.ts";
 import type { WakeTarget } from "../shared/types.ts";
 
+const previousWakeClaude = process.env.AGENT_PEERS_WAKE_CLAUDE;
+
 type PaneInfo = {
   tty: string;
   pane_id: string;
@@ -55,13 +57,24 @@ function installFakeTmux(opts: {
 
 afterEach(() => {
   __setTmuxWakeAdapterForTest(null);
+  if (previousWakeClaude === undefined) {
+    delete process.env.AGENT_PEERS_WAKE_CLAUDE;
+  } else {
+    process.env.AGENT_PEERS_WAKE_CLAUDE = previousWakeClaude;
+  }
 });
+
+function allowClaudeWake(): void {
+  process.env.AGENT_PEERS_WAKE_CLAUDE = "on";
+}
 
 function fixture(name: string): string {
   return readFileSync(new URL(`./fixtures/idle-active/${name}`, import.meta.url), "utf8");
 }
 
 const CODEX_IDLE = fixture("codex-0.137-idle.txt");
+const CODEX_0142_IDLE = fixture("codex-0.142-idle.txt");
+const CODEX_0200_IDLE = fixture("codex-0.200-idle.txt");
 const CODEX_ACTIVE = fixture("codex-0.137-active.txt");
 const CLAUDE_2170_IDLE = fixture("claude-2.1.170-idle.txt");
 const CLAUDE_2170_ACTIVE = fixture("claude-2.1.170-active.txt");
@@ -107,6 +120,30 @@ test("log-only validates idle target and sends zero keys", async () => {
   expect(literals).toEqual([]);
 });
 
+test("current Codex 0.142 idle footer is accepted", async () => {
+  const { sent, literals } = installFakeTmux({
+    panes: [{ tty: "pts/9", pane_id: "%1", command: "codex", cwd: "/repo/subdir", title: "peer:zesty-codex" }],
+    captures: [CODEX_0142_IDLE, CODEX_0142_IDLE],
+  });
+  const res = await wakePeerIfIdle(target(), "log-only");
+  expect(res.result).toBe("would_wake");
+  expect(res.idle_proof).toContain("2 stable codex idle samples");
+  expect(sent).toEqual([]);
+  expect(literals).toEqual([]);
+});
+
+test("future Codex 0.x idle footer is accepted", async () => {
+  const { sent, literals } = installFakeTmux({
+    panes: [{ tty: "pts/9", pane_id: "%1", command: "codex", cwd: "/repo/subdir", title: "peer:zesty-codex" }],
+    captures: [CODEX_0200_IDLE, CODEX_0200_IDLE],
+  });
+  const res = await wakePeerIfIdle(target(), "log-only");
+  expect(res.result).toBe("would_wake");
+  expect(res.idle_proof).toContain("2 stable codex idle samples");
+  expect(sent).toEqual([]);
+  expect(literals).toEqual([]);
+});
+
 test("on mode sends content-free Codex F4 plus fixed prompt and delayed Enter", async () => {
   const { sent, literals } = installFakeTmux({
     panes: [{ tty: "/dev/pts/9", pane_id: "%1", command: "codex", cwd: "/repo", title: "peer:zesty-codex" }],
@@ -119,6 +156,7 @@ test("on mode sends content-free Codex F4 plus fixed prompt and delayed Enter", 
 });
 
 test("on mode sends fixed prompt only for Claude", async () => {
+  allowClaudeWake();
   const { sent, literals } = installFakeTmux({
     panes: [{ tty: "pts/4", pane_id: "%4", command: "claude", cwd: "/repo", title: "peer:zany-claude" }],
     captures: [CLAUDE_2170_IDLE, CLAUDE_2170_IDLE, CLAUDE_2170_IDLE],
@@ -133,7 +171,24 @@ test("on mode sends fixed prompt only for Claude", async () => {
   expect(literals).toEqual(["Check agent-peers now."]);
 });
 
+test("Claude target is excluded by default without inspecting tmux or sending keys", async () => {
+  const { sent, literals } = installFakeTmux({
+    panes: [{ tty: "pts/4", pane_id: "%4", command: "claude", cwd: "/repo", title: "peer:zany-claude" }],
+    captures: [CLAUDE_2170_IDLE, CLAUDE_2170_IDLE, CLAUDE_2170_IDLE],
+  });
+  const res = await wakePeerIfIdle(target({
+    peer_type: "claude",
+    name: "zany-claude",
+    tty: "pts/4",
+  }), "on");
+  expect(res.result).toBe("skipped_peer_type_excluded");
+  expect(res.idle_proof).toContain("same-host tmux wake redundant");
+  expect(sent).toEqual([]);
+  expect(literals).toEqual([]);
+});
+
 test("Claude 2.1.170 structural idle footer is accepted, but active spinner is not", async () => {
+  allowClaudeWake();
   const { sent: idleSent, literals: idleLiterals } = installFakeTmux({
     panes: [{ tty: "pts/4", pane_id: "%4", command: "claude", cwd: "/repo", title: "peer:zany-claude" }],
     captures: [CLAUDE_2170_IDLE, CLAUDE_2170_IDLE],
@@ -163,6 +218,7 @@ test("Claude 2.1.170 structural idle footer is accepted, but active spinner is n
 });
 
 test("old active transcript above the bottom band does not contaminate current idle proof", async () => {
+  allowClaudeWake();
   installFakeTmux({
     panes: [{ tty: "pts/4", pane_id: "%4", command: "claude", cwd: "/repo", title: "peer:zany-claude" }],
     captures: [CONTAMINATED_HISTORY_WITH_IDLE_FOOTER, CONTAMINATED_HISTORY_WITH_IDLE_FOOTER],
@@ -176,6 +232,7 @@ test("old active transcript above the bottom band does not contaminate current i
 });
 
 test("Claude auto-mode idle footer is accepted", async () => {
+  allowClaudeWake();
   const { sent, literals } = installFakeTmux({
     panes: [{ tty: "pts/4", pane_id: "%4", command: "claude", cwd: "/repo", title: "peer:zany-claude" }],
     captures: [CLAUDE_2173_AUTO_IDLE, CLAUDE_2173_AUTO_IDLE],

@@ -613,7 +613,7 @@ export function pollMessages(db: Database, id: string, session_token: string): L
 
     const rows = db.query<
       { id: number; from_id: string; to_id: string; text: string; sent_at: string },
-      [string, string]
+      [string]
     >(
       `SELECT id, from_id, to_id, text, sent_at
        FROM messages

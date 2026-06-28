@@ -173,6 +173,7 @@ export type WakeResult =
   | "would_wake_low_confidence" // log-only: tty+scope ok but missing 2nd identity signal
   | "skipped_active"           // an active marker was visible → never inject
   | "skipped_not_idle"         // no positive idle proof (e.g. only one stable sample)
+  | "skipped_peer_type_excluded" // peer type disabled by wake policy
   | "skipped_no_pane"          // tty resolves to no live tmux pane
   | "skipped_ambiguous"        // >1 candidate pane matched
   | "skipped_scope_mismatch"   // pane cwd outside registered project/git_root

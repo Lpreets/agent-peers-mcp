@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import type { WakeDecision, WakeMode, WakePeerIfIdle, WakeTarget } from "./types.ts";
+import { readWakeClaude } from "./wake-worker.ts";
 
 type PaneInfo = {
   tty: string;
@@ -22,7 +23,7 @@ const CLAUDE_ACTIVE_MARKERS = /(^[●✻]\s+\S+ing…|⎿\s+Running…|esc to in
 const CODEX_ACTIVE_MARKERS = /(Working \(|esc to interrupt)/;
 const CLAUDE_IDLE_FOOTER = /Opus .*\s+·\s+v2\.1\.[0-9]+\s+·\s+Context [0-9]+%/;
 const CLAUDE_PERMISSION_FOOTER = /(bypass permissions on|auto mode on)/;
-const CODEX_IDLE_FOOTER = /gpt-5\.[0-9a-z-]* .* · 0\.13[0-9]\.[0-9]+ · Context [0-9]+%( [Ll]eft)?/;
+const CODEX_IDLE_FOOTER = /gpt-5\.[0-9a-z-]* .* · 0\.[0-9]+\.[0-9]+ · Context [0-9]+%( [Ll]eft)?/;
 const CODEX_PROMPT_BAND = /(^|\n)[›❯]/;
 const WAKE_TEXT = "Check agent-peers now.";
 type PaneActivity = "active" | "idle" | "unknown";
@@ -160,6 +161,14 @@ export const wakePeerIfIdle: WakePeerIfIdle = async (target, mode) => {
   try {
     if (mode === "off") {
       return decision(target, mode, "skipped_not_idle", "wake mode off");
+    }
+    if (target.peer_type === "claude" && readWakeClaude() !== "on") {
+      return decision(
+        target,
+        mode,
+        "skipped_peer_type_excluded",
+        "claude has reliable channel push; same-host tmux wake redundant",
+      );
     }
 
     const tty = normalizeTty(target.tty);
