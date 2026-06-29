@@ -194,6 +194,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           p.host ? `  Host: ${p.host}` : null,
           `  CWD: ${p.cwd}`,
           p.tty ? `  TTY: ${p.tty}` : null,
+          `  Liveness: ${p.liveness ?? "unknown"}`,
           p.summary ? `  Summary: ${p.summary}` : null,
           `  Last seen: ${p.last_seen}`,
         ].filter(Boolean).join("\n")
