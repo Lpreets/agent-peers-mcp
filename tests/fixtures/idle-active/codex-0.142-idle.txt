@@ -1,2 +1,2 @@
 › Summarize recent commits
-gpt-5.5 low · 0.142.2 · Context 70% left · 5h 88% left · weekly 70% left · 258K window · master · ~/Projects/MSAASA
+gpt-5.5 low · Context 98% left · ~/Projects/MSAASA · MSAASA · Context 2% used · 5h 72% left · weekly 96% left · 258K window · 32.6K…
