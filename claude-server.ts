@@ -114,7 +114,7 @@ const TOOLS = [
   {
     name: "list_peers",
     description:
-      "List other AI agent peers on this machine. Returns id, human name, peer_type (claude|codex), cwd, summary.",
+      "List other AI agent peers on this machine. Returns id, human name, peer_type (claude|codex), cwd, summary. Each peer includes `liveness` (alive|dead|unknown); prefer `alive` peers, a peer named in your continuation docs MUST be liveness-verified before dispatch (S308 D8), and `unknown` (cross-host) is not a guarantee.",
     inputSchema: {
       type: "object" as const,
       properties: {

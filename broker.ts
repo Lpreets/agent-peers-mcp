@@ -18,8 +18,8 @@ import type {
 } from "./shared/types.ts";
 import { generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
 import { startWakeWorker, type WakeWorker } from "./shared/wake-worker.ts";
-import { normalizeHostId } from "./shared/host-id.ts";
-import { resolveHostId } from "./shared/host-id.ts";
+import { normalizeHostId, resolveHostId } from "./shared/host-id.ts";
+import { canSignalPid, type SignalProbe } from "./shared/parent-liveness.ts";
 import {
   ackHostIntent,
   enqueueRemoteWakeIntent,
@@ -440,7 +440,12 @@ export function getPeerByName(db: Database, name: string): Peer | null {
 
 // ----- Listing -----
 
-export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
+export function listPeers(
+  db: Database,
+  req: ListPeersRequest,
+  localHost: string | null = resolveHostId(),
+  signalProbe: SignalProbe = canSignalPid,
+): Peer[] {
   // Opportunistic cleanup — run GC before listing so a user who just closed a
   // session tab doesn't see their own ghost peer. Complements the 30s timer GC.
   gcStalePeers(db);
@@ -486,7 +491,20 @@ export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
   const sql = `SELECT id, name, peer_type, pid, cwd, git_root, tty, summary,
                       host, registered_at, last_seen
                FROM peers ${where} ORDER BY last_seen DESC`;
-  return db.query<Peer, typeof params>(sql).all(...params);
+  const rows = db.query<Peer, typeof params>(sql).all(...params);
+  // Annotate each peer with a computed liveness signal. HOST-GATED: only call
+  // canSignalPid (process.kill(pid,0)) for same-host peers. Cross-host pids map
+  // against the LOCAL process table and will false-positive against unrelated
+  // processes — never signal them. `liveness = "unknown"` for all remote peers.
+  return rows.map((peer) => {
+    let liveness: "alive" | "dead" | "unknown";
+    if (localHost !== null && peer.host !== null && peer.host === localHost) {
+      liveness = signalProbe(peer.pid) ? "alive" : "dead";
+    } else {
+      liveness = "unknown";
+    }
+    return { ...peer, liveness };
+  });
 }
 
 // ----- Send -----
@@ -977,7 +995,7 @@ export function startBroker(
           case "/heartbeat":     { const b = await readJson<{ id: string; session_token: string }>(req); heartbeatPeer(db, b.id, b.session_token); return json({ ok: true }); }
           case "/unregister":    { const b = await readJson<{ id: string; session_token: string }>(req); unregisterPeer(db, b.id, b.session_token); return json({ ok: true }); }
           case "/set-summary":   { const b = await readJson<{ id: string; session_token: string; summary: string }>(req); setPeerSummary(db, b.id, b.session_token, b.summary); return json({ ok: true }); }
-          case "/list-peers":    return json(listPeers(db, await readJson(req)));
+          case "/list-peers":    return json(listPeers(db, await readJson(req), brokerHostId));
           case "/send-message":  {
             const resp = sendMessage(db, await readJson(req));
             // Fire-and-forget wake enqueue AFTER the message is durably

@@ -17,6 +17,7 @@ export interface Peer {
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
+  liveness?: "alive" | "dead" | "unknown";
 }
 
 export interface LeasedMessage {
