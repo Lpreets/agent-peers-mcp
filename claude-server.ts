@@ -36,7 +36,8 @@ import { recordDelivered, getRecentDelivered } from "./shared/recent-delivered.t
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import { checkInitialParentLiveness } from "./shared/parent-liveness.ts";
-import type { PeerId } from "./shared/types.ts";
+import { createAuthLostHandler } from "./shared/session-loss.ts";
+import type { PeerId, SendMessageResponse } from "./shared/types.ts";
 
 const BROKER_CONFIG = resolveBrokerClientConfig();
 const BROKER_URL = BROKER_CONFIG.brokerUrl;
@@ -47,6 +48,9 @@ function log(msg: string) {
   // MCP stdio servers must only use stderr for logging (stdout is the protocol).
   console.error(`[agent-peers/claude] ${msg}`);
 }
+
+const authLost = createAuthLostHandler({ component: "claude" });
+const AUTH_LOST_TOOL_TEXT = "AUTH_LOST: broker session expired; local MCP server is exiting";
 
 // The shared secret is only known after the broker has provisioned it, so
 // we defer client construction until main() can read the secret file.
@@ -174,6 +178,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       isError: true,
     };
   }
+  if (authLost.isLost()) {
+    return {
+      content: [{ type: "text" as const, text: AUTH_LOST_TOOL_TEXT }],
+      isError: true,
+    };
+  }
+  // Claude does not inline-poll on every tool call the way Codex does.
+  // Authenticate the session before dispatch so list/check/rename cannot
+  // return a false-green result in the collision-to-next-poll race window.
+  try {
+    await client.heartbeat({ id: myId, session_token: mySession });
+  } catch (e) {
+    if (authLost.exitIfSessionExpired("heartbeat", e)) {
+      return {
+        content: [{ type: "text" as const, text: AUTH_LOST_TOOL_TEXT }],
+        isError: true,
+      };
+    }
+    log(`tool preflight heartbeat failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
 
   switch (name) {
     case "list_peers": {
@@ -204,10 +228,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     case "send_message": {
       const { to_id, message } = args as { to_id: string; message: string };
-      const res = await client.sendMessage({
-        from_id: myId, session_token: mySession, to_id_or_name: to_id, text: message,
-      });
+      let res: SendMessageResponse;
+      try {
+        res = await client.sendMessage({
+          from_id: myId, session_token: mySession, to_id_or_name: to_id, text: message,
+        });
+      } catch (e) {
+        if (authLost.exitIfSessionExpired("send_message", e)) {
+          return { content: [{ type: "text" as const, text: AUTH_LOST_TOOL_TEXT }], isError: true };
+        }
+        throw e;
+      }
       if (!res.ok) {
+        if (authLost.exitIfUnauthorizedSend(res)) {
+          return { content: [{ type: "text" as const, text: AUTH_LOST_TOOL_TEXT }], isError: true };
+        }
         return { content: [{ type: "text" as const, text: `Send failed: ${res.error}` }], isError: true };
       }
       return { content: [{ type: "text" as const, text: `Message sent (id=${res.message_id}).` }] };
@@ -215,7 +250,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     case "set_summary": {
       const { summary } = args as { summary: string };
-      await client.setSummary({ id: myId, session_token: mySession, summary });
+      try {
+        await client.setSummary({ id: myId, session_token: mySession, summary });
+      } catch (e) {
+        if (authLost.exitIfSessionExpired("summary", e)) {
+          return { content: [{ type: "text" as const, text: AUTH_LOST_TOOL_TEXT }], isError: true };
+        }
+        throw e;
+      }
       return { content: [{ type: "text" as const, text: `Summary set: "${summary}"` }] };
     }
 
@@ -378,8 +420,10 @@ async function main() {
       if (initialSummary && myId && mySession) {
         try {
           await client.setSummary({ id: myId, session_token: mySession, summary: initialSummary });
-        } catch {
-          /* non-critical */
+        } catch (e) {
+          if (!authLost.exitIfSessionExpired("summary", e)) {
+            log(`late summary failed: ${e instanceof Error ? e.message : String(e)}`);
+          }
         }
       }
     });
@@ -451,6 +495,7 @@ async function main() {
         }
       }
     } catch (e) {
+      if (authLost.exitIfSessionExpired("poll", e)) return;
       log(`poll error: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
@@ -482,7 +527,13 @@ async function main() {
         clearTabTitleSync();
         process.exit(0);
       }
-      try { await client.heartbeat({ id: myId, session_token: mySession }); } catch { /* non-critical */ }
+      try {
+        await client.heartbeat({ id: myId, session_token: mySession });
+      } catch (e) {
+        if (!authLost.exitIfSessionExpired("heartbeat", e)) {
+          log(`heartbeat failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
     }
   }, HEARTBEAT_INTERVAL_MS);
 
@@ -511,7 +562,11 @@ main().catch(async (e) => {
   // reclaim. Unregister explicitly so the row doesn't block same-name reclaim
   // for 60s. Post-connect failures use the signal-handler path (no unregister).
   if (myId && mySession) {
-    try { await client.unregister({ id: myId, session_token: mySession }); } catch { /* best effort */ }
+    try {
+      await client.unregister({ id: myId, session_token: mySession });
+    } catch (unregisterError) {
+      authLost.exitIfSessionExpired("unregister", unregisterError);
+    }
   }
   process.exit(1);
 });

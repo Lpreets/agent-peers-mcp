@@ -80,7 +80,8 @@ import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import { checkInitialParentLiveness } from "./shared/parent-liveness.ts";
-import type { PeerId, LeasedMessage } from "./shared/types.ts";
+import { createAuthLostHandler } from "./shared/session-loss.ts";
+import type { PeerId, LeasedMessage, SendMessageResponse } from "./shared/types.ts";
 
 const BROKER_CONFIG = resolveBrokerClientConfig();
 const BROKER_URL = BROKER_CONFIG.brokerUrl;
@@ -90,6 +91,9 @@ const HEARTBEAT_INTERVAL_MS = 15_000;
 function log(msg: string) {
   console.error(`[agent-peers/codex] ${msg}`);
 }
+
+const authLost = createAuthLostHandler({ component: "codex" });
+const AUTH_LOST_TOOL_TEXT = "AUTH_LOST: broker session expired; local MCP server is exiting";
 
 let client: ReturnType<typeof createClient>;
 async function isBrokerAlive(): Promise<boolean> {
@@ -246,6 +250,7 @@ async function pollBrokerIntoQueue(): Promise<void> {
     try {
       leased = await client.pollMessages({ id: myId!, session_token: mySession! });
     } catch (e) {
+      if (authLost.exitIfSessionExpired("poll", e)) return;
       log(`poll failed: ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
@@ -339,6 +344,9 @@ async function pollBrokerIntoQueue(): Promise<void> {
 async function withPiggyback(
   handler: () => Promise<{ text: string; isError?: boolean }>,
 ): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
+  if (authLost.isLost()) {
+    return { content: [{ type: "text", text: AUTH_LOST_TOOL_TEXT }], isError: true };
+  }
   if (!myId || !mySession) {
     return {
       content: [{ type: "text", text: "Not registered with broker yet" }],
@@ -406,7 +414,13 @@ async function withPiggyback(
   try {
     await pollBrokerIntoQueue();
   } catch (e) {
+    if (authLost.exitIfSessionExpired("poll", e)) {
+      return { content: [{ type: "text", text: AUTH_LOST_TOOL_TEXT }], isError: true };
+    }
     log(`inline poll failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (authLost.isLost()) {
+    return { content: [{ type: "text", text: AUTH_LOST_TOOL_TEXT }], isError: true };
   }
 
   // ------------------------------------------------------------------------
@@ -501,16 +515,36 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case "send_message": {
         const { to_id, message } = args as { to_id: string; message: string };
-        const res = await client.sendMessage({
-          from_id: myId!, session_token: mySession!, to_id_or_name: to_id, text: message,
-        });
-        if (!res.ok) return { text: `Send failed: ${res.error}`, isError: true };
+        let res: SendMessageResponse;
+        try {
+          res = await client.sendMessage({
+            from_id: myId!, session_token: mySession!, to_id_or_name: to_id, text: message,
+          });
+        } catch (e) {
+          if (authLost.exitIfSessionExpired("send_message", e)) {
+            return { text: AUTH_LOST_TOOL_TEXT, isError: true };
+          }
+          throw e;
+        }
+        if (!res.ok) {
+          if (authLost.exitIfUnauthorizedSend(res)) {
+            return { text: AUTH_LOST_TOOL_TEXT, isError: true };
+          }
+          return { text: `Send failed: ${res.error}`, isError: true };
+        }
         return { text: `Message sent (id=${res.message_id}).` };
       }
 
       case "set_summary": {
         const { summary } = args as { summary: string };
-        await client.setSummary({ id: myId!, session_token: mySession!, summary });
+        try {
+          await client.setSummary({ id: myId!, session_token: mySession!, summary });
+        } catch (e) {
+          if (authLost.exitIfSessionExpired("summary", e)) {
+            return { text: AUTH_LOST_TOOL_TEXT, isError: true };
+          }
+          throw e;
+        }
         return { text: `Summary set: "${summary}"` };
       }
 
@@ -632,7 +666,13 @@ async function main() {
   if (!initialSummary) {
     summaryPromise.then(async () => {
       if (initialSummary && myId && mySession) {
-        try { await client.setSummary({ id: myId, session_token: mySession, summary: initialSummary }); } catch { /* non-critical */ }
+        try {
+          await client.setSummary({ id: myId, session_token: mySession, summary: initialSummary });
+        } catch (e) {
+          if (!authLost.exitIfSessionExpired("summary", e)) {
+            log(`late summary failed: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
       }
     });
   }
@@ -662,7 +702,13 @@ async function main() {
         clearTabTitleSync();
         process.exit(0);
       }
-      try { await client.heartbeat({ id: myId, session_token: mySession }); } catch { /* non-critical */ }
+      try {
+        await client.heartbeat({ id: myId, session_token: mySession });
+      } catch (e) {
+        if (!authLost.exitIfSessionExpired("heartbeat", e)) {
+          log(`heartbeat failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
     }
   }, HEARTBEAT_INTERVAL_MS);
 
@@ -687,7 +733,11 @@ main().catch(async (e) => {
   // Same rationale as claude-server: pre-connect failure has no active session
   // to preserve, so unregister the row so it doesn't block reclaim.
   if (myId && mySession) {
-    try { await client.unregister({ id: myId, session_token: mySession }); } catch { /* best effort */ }
+    try {
+      await client.unregister({ id: myId, session_token: mySession });
+    } catch (unregisterError) {
+      authLost.exitIfSessionExpired("unregister", unregisterError);
+    }
   }
   process.exit(1);
 });

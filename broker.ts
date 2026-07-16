@@ -36,6 +36,13 @@ export const LEASE_DURATION_MS = 30_000;
 export const GC_INTERVAL_MS = 30_000;
 export const SECRET_HEADER = "x-agent-peers-secret";
 
+export class SessionExpiredError extends Error {
+  constructor() {
+    super("session expired or unknown peer");
+    this.name = "SessionExpiredError";
+  }
+}
+
 function nowIso(): string { return new Date().toISOString(); }
 
 function isUniqueViolation(e: unknown): boolean {
@@ -406,19 +413,22 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
 // peer's row. Binding the token in WHERE closes that race.
 
 export function heartbeatPeer(db: Database, id: string, session_token: string): void {
-  db.query("UPDATE peers SET last_seen = ? WHERE id = ? AND session_token = ?")
+  const info = db.query("UPDATE peers SET last_seen = ? WHERE id = ? AND session_token = ?")
     .run(nowIso(), id, session_token);
+  if ((info.changes ?? 0) === 0) throw new SessionExpiredError();
 }
 
 export function unregisterPeer(db: Database, id: string, session_token: string): void {
   // Messages stay as orphans (spec §5.1).
-  db.query("DELETE FROM peers WHERE id = ? AND session_token = ?")
+  const info = db.query("DELETE FROM peers WHERE id = ? AND session_token = ?")
     .run(id, session_token);
+  if ((info.changes ?? 0) === 0) throw new SessionExpiredError();
 }
 
 export function setPeerSummary(db: Database, id: string, session_token: string, summary: string): void {
-  db.query("UPDATE peers SET summary = ?, last_seen = ? WHERE id = ? AND session_token = ?")
+  const info = db.query("UPDATE peers SET summary = ?, last_seen = ? WHERE id = ? AND session_token = ?")
     .run(summary, nowIso(), id, session_token);
+  if ((info.changes ?? 0) === 0) throw new SessionExpiredError();
 }
 
 // Both getters deliberately use explicit column projection (NOT `SELECT *`)
@@ -620,13 +630,14 @@ export function pollMessages(db: Database, id: string, session_token: string): L
     // Session-token auth — caller must prove peer ownership.
     // The UPDATE with both predicates serves as atomic auth + heartbeat:
     // if the token doesn't match or the peer is gone, 0 rows update, and we
-    // return empty (matches "no messages" semantically, without exposing
-    // anyone's mailbox).
+    // fail as typed session loss. Returning [] would make an expired holder
+    // indistinguishable from a healthy empty inbox and leave the MCP server
+    // false-green after a same-TTY replacement rotated its token.
     const hbInfo = db.query(
       "UPDATE peers SET last_seen = ? WHERE id = ? AND session_token = ?"
     ).run(nowStr, id, session_token);
     if ((hbInfo.changes ?? 0) === 0) {
-      return [] as LeasedMessage[];
+      throw new SessionExpiredError();
     }
 
     const rows = db.query<
@@ -1022,6 +1033,9 @@ export function startBroker(
           default: return json({ error: "not found" }, { status: 404 });
         }
       } catch (e) {
+        if (e instanceof SessionExpiredError) {
+          return json({ error: "session expired" }, { status: 401 });
+        }
         console.error("[broker] request error:", e);
         return json({ error: e instanceof Error ? e.message : String(e) }, { status: 500 });
       }

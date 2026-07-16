@@ -42,6 +42,17 @@ export interface BrokerClientOptions {
   fetchImpl?: FetchLike;
 }
 
+export class BrokerHttpError extends Error {
+  constructor(readonly path: string, readonly status: number) {
+    super(`broker ${path}: HTTP ${status}`);
+    this.name = "BrokerHttpError";
+  }
+}
+
+export function isSessionExpiredError(error: unknown): boolean {
+  return error instanceof BrokerHttpError && error.status === 401;
+}
+
 const DEFAULT_SEND_RETRY: Required<SendRetryOptions> = {
   attempts: 8,
   delaysMs: [100, 150, 250, 400, 650, 900, 1200],
@@ -123,7 +134,13 @@ export function createClient(baseUrl: string, sharedSecret: string, options: Bro
       body: JSON.stringify(body),
       ...(signal ? { signal } : {}),
     });
-    if (!res.ok) throw new Error(`broker ${path}: ${res.status} ${await res.text()}`);
+    if (!res.ok) {
+      // Drain the response for connection reuse, but do not embed broker text
+      // in the exception. Callers need a typed status/path and must never
+      // accidentally surface credentials or other response details.
+      await res.text();
+      throw new BrokerHttpError(path, res.status);
+    }
     return res.json() as Promise<T>;
   }
 
@@ -138,6 +155,7 @@ export function createClient(baseUrl: string, sharedSecret: string, options: Bro
       try {
         return await postOnce<T>("/send-message", body, retry.requestTimeoutMs);
       } catch (err) {
+        if (err instanceof BrokerHttpError) throw err;
         if (!isPreCommitBrokerUnavailable(err)) {
           throw new Error(
             `delivery uncertain: broker send failed after connection may have been established; ` +

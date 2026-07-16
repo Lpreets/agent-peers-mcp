@@ -16,6 +16,7 @@ import {
   renamePeer,
   gcStalePeers,
   listOrphanedMessages,
+  SessionExpiredError,
 } from "../broker.ts";
 import type { Database } from "bun:sqlite";
 import { unlinkSync, existsSync } from "node:fs";
@@ -162,7 +163,7 @@ test("registerPeer replaces live peer in same tty cwd and type, preserving id an
   ).get(second.id)!;
   expect(row).toEqual({ pid: 202, cwd: "/repo", tty: "pts/9", peer_type: "codex" });
 
-  heartbeatPeer(db, first.id, first.session_token);
+  expect(() => heartbeatPeer(db, first.id, first.session_token)).toThrow(SessionExpiredError);
   expect(getPeer(db, second.id)?.pid).toBe(202);
 });
 
@@ -279,11 +280,11 @@ test("heartbeatPeer bumps last_seen with valid token", async () => {
   expect(getPeer(db, a.id)!.last_seen > initial).toBe(true);
 });
 
-test("heartbeatPeer with WRONG token silently no-ops (auth)", async () => {
+test("heartbeatPeer with WRONG token throws typed session loss", async () => {
   const a = reg({});
   const initial = getPeer(db, a.id)!.last_seen;
   await new Promise((r) => setTimeout(r, 20));
-  heartbeatPeer(db, a.id, "wrong-token");
+  expect(() => heartbeatPeer(db, a.id, "wrong-token")).toThrow(SessionExpiredError);
   expect(getPeer(db, a.id)!.last_seen).toBe(initial);
 });
 
@@ -293,9 +294,9 @@ test("setPeerSummary updates summary with valid token", () => {
   expect(getPeer(db, a.id)?.summary).toBe("Working on X");
 });
 
-test("setPeerSummary with wrong token is silently ignored (auth)", () => {
+test("setPeerSummary with wrong token throws typed session loss", () => {
   const a = reg({});
-  setPeerSummary(db, a.id, "wrong", "MALICIOUS");
+  expect(() => setPeerSummary(db, a.id, "wrong", "MALICIOUS")).toThrow(SessionExpiredError);
   expect(getPeer(db, a.id)?.summary).toBe("");
 });
 
@@ -311,11 +312,11 @@ test("unregisterPeer removes peer row with valid token, preserves messages", () 
   expect(remaining?.c).toBe(1);
 });
 
-test("unregisterPeer with wrong token silently no-ops (auth — cannot delete another peer)", () => {
+test("unregisterPeer with wrong token throws typed session loss and cannot delete another peer", () => {
   const a = reg({ name: "a" });
   const b = reg({ name: "b" });
   // 'a' tries to unregister 'b' using a's token
-  unregisterPeer(db, b.id, a.session_token);
+  expect(() => unregisterPeer(db, b.id, a.session_token)).toThrow(SessionExpiredError);
   expect(getPeer(db, b.id)).not.toBeNull();
 });
 
@@ -621,18 +622,17 @@ function pair() {
   return { a, b };
 }
 
-test("pollMessages with WRONG session_token returns empty (no drain)", () => {
+test("pollMessages with WRONG session_token throws typed session loss without draining", () => {
   const { a, b } = pair();
   sendMessage(db, { from_id: a.id, session_token: a.session_token, to_id_or_name: "beta", text: "secret" });
-  const stranger = pollMessages(db, b.id, "wrong-token");
-  expect(stranger).toEqual([]);
+  expect(() => pollMessages(db, b.id, "wrong-token")).toThrow(SessionExpiredError);
   // Legitimate owner still can
   expect(pollMessages(db, b.id, b.session_token).length).toBe(1);
 });
 
-test("pollMessages with unknown peer id returns empty", () => {
-  const stranger = pollMessages(db, "00000000-0000-0000-0000-000000000000", "any");
-  expect(stranger).toEqual([]);
+test("pollMessages with unknown peer id throws typed session loss", () => {
+  expect(() => pollMessages(db, "00000000-0000-0000-0000-000000000000", "any"))
+    .toThrow(SessionExpiredError);
 });
 
 test("pollMessages returns leased messages with enriched fields", () => {
