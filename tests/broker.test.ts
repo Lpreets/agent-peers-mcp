@@ -260,6 +260,172 @@ test("registerPeer null host and populated host are distinct during transition",
   expect(listPeers(db, { scope: "machine", cwd: "/any", git_root: null, peer_type: "codex" })).toHaveLength(1);
 });
 
+test("stale peers stay absent from machine/directory/repo and from unrelated re-registration", () => {
+  const staleMachine = reg({
+    name: "stale-public-machine",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/stale-cwd-machine",
+    git_root: "/stale-repo",
+    tty: "pts/9",
+    pid: 222,
+  });
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
+    .run("2000-01-01T00:00:00.000Z", staleMachine.id);
+  const controlMachine = reg({
+    name: "control-public-machine",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/stale-cwd-machine",
+    git_root: "/stale-repo",
+    tty: "pts/10",
+    pid: 223,
+  });
+
+  const machinePeers = listPeers(db, { scope: "machine", cwd: "/any", git_root: null, peer_type: "codex" });
+  expect(machinePeers.some((peer) => peer.id === staleMachine.id)).toBe(false);
+  expect(machinePeers.some((peer) => peer.id === controlMachine.id)).toBe(true);
+
+  const staleDirectory = reg({
+    name: "stale-public-directory",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/stale-cwd-directory",
+    git_root: "/stale-directory-repo",
+    tty: "pts/1",
+    pid: 224,
+  });
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
+    .run("2000-01-01T00:00:00.000Z", staleDirectory.id);
+  const controlDirectory = reg({
+    name: "control-public-directory",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/stale-cwd-directory",
+    git_root: "/stale-directory-repo",
+    tty: "pts/2",
+    pid: 225,
+  });
+
+  const directoryPeers = listPeers(db, {
+    scope: "directory",
+    cwd: "/stale-cwd-directory",
+    git_root: null,
+    peer_type: "codex",
+  });
+  expect(directoryPeers.some((peer) => peer.id === staleDirectory.id)).toBe(false);
+  expect(directoryPeers.some((peer) => peer.id === controlDirectory.id)).toBe(true);
+
+  const staleRepo = reg({
+    name: "stale-public-repo",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/stale-cwd-repo",
+    git_root: "/stale-repo-anchor",
+    tty: "pts/3",
+    pid: 226,
+  });
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
+    .run("2000-01-01T00:00:00.000Z", staleRepo.id);
+  const controlRepo = reg({
+    name: "control-public-repo",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/stale-cwd-repo",
+    git_root: "/stale-repo-anchor",
+    tty: "pts/4",
+    pid: 227,
+  });
+
+  const repoPeers = listPeers(db, {
+    scope: "repo",
+    cwd: "/stale-cwd-repo",
+    git_root: "/stale-repo-anchor",
+    peer_type: "codex",
+  });
+  expect(repoPeers.some((peer) => peer.id === staleRepo.id)).toBe(false);
+  expect(repoPeers.some((peer) => peer.id === controlRepo.id)).toBe(true);
+});
+
+test("current unauthenticated stale-name reclaim preserves identity + mailbox while denying old session", () => {
+  const sender = reg({
+    name: "mailbox-sender",
+    peer_type: "claude",
+    host: "lpreet-pco",
+    cwd: "/legacy-queue-stale",
+    tty: "pts/2",
+    pid: 333,
+    git_root: "/legacy-queue",
+  });
+  const stale = reg({
+    name: "stale-reclaimer",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/legacy-queue-stale",
+    tty: "pts/3",
+    pid: 444,
+    git_root: "/legacy-queue",
+  });
+
+  const leased = sendMessage(db, {
+    from_id: sender.id, session_token: sender.session_token, to_id_or_name: stale.name, text: "inflight",
+  });
+  expect(leased.ok).toBe(true);
+  expect(pollMessages(db, stale.id, stale.session_token).length).toBe(1);
+
+  const backlog = sendMessage(db, {
+    from_id: sender.id, session_token: sender.session_token, to_id_or_name: stale.name, text: "backlog",
+  });
+  expect(backlog.ok).toBe(true);
+
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
+    .run("2000-01-01T00:00:00.000Z", stale.id);
+
+  const reclaimed = reg({
+    name: stale.name,
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/legacy-queue-new",
+    tty: "pts/4",
+    pid: 555,
+    git_root: "/legacy-queue",
+  });
+  expect(reclaimed.id).toBe(stale.id);
+  expect(reclaimed.name).toBe(stale.name);
+  expect(reclaimed.session_token).not.toBe(stale.session_token);
+
+  const reclaimedBacklog = pollMessages(db, reclaimed.id, reclaimed.session_token);
+  expect(reclaimedBacklog.map((message) => message.text).sort()).toEqual(["backlog", "inflight"]);
+  expect(() => heartbeatPeer(db, reclaimed.id, reclaimed.session_token)).not.toThrow();
+  expect(() => setPeerSummary(db, reclaimed.id, reclaimed.session_token, "new-holder-summary")).not.toThrow();
+
+  const fresh = sendMessage(db, {
+    from_id: sender.id,
+    session_token: sender.session_token,
+    to_id_or_name: reclaimed.name,
+    text: "fresh-inbound",
+  });
+  expect(fresh.ok).toBe(true);
+  const freshInbox = pollMessages(db, reclaimed.id, reclaimed.session_token);
+  expect(freshInbox.map((message) => message.text).sort()).toEqual(["backlog", "fresh-inbound", "inflight"]);
+  const ack = ackMessages(db, {
+    id: reclaimed.id,
+    session_token: reclaimed.session_token,
+    lease_tokens: freshInbox.map((message) => message.lease_token),
+  });
+  expect(ack.acked).toBe(3);
+
+  expect(() => heartbeatPeer(db, stale.id, stale.session_token)).toThrow(SessionExpiredError);
+  expect(() => setPeerSummary(db, stale.id, stale.session_token, "old-holder")).toThrow(SessionExpiredError);
+  const staleSendAttempt = sendMessage(db, {
+    from_id: stale.id, session_token: stale.session_token, to_id_or_name: sender.id, text: "should be denied",
+  });
+  expect(staleSendAttempt.ok).toBe(false);
+  expect(staleSendAttempt.error).toMatch(/^unauthorized sender:/);
+  expect(staleSendAttempt.error).not.toContain(stale.session_token);
+  expect(staleSendAttempt.error).not.toContain("should be denied");
+});
+
 test("registerPeer is atomic under simulated interleaving", () => {
   db.query(
     `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)

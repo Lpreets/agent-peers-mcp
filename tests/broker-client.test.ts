@@ -11,7 +11,7 @@ import { chmodSync, readFileSync, unlinkSync, existsSync, writeFileSync } from "
 
 const TEST_DB = "/tmp/agent-peers-e2e-" + Date.now() + ".db";
 const TEST_SECRET = "/tmp/agent-peers-e2e-secret-" + Date.now();
-const TEST_PORT = 7911;
+let TEST_PORT = 0;
 let handle: ReturnType<typeof startBroker>;
 let testSecret: string;
 let previousWakeMode: string | undefined;
@@ -20,6 +20,7 @@ beforeAll(() => {
   previousWakeMode = process.env.AGENT_PEERS_WAKE_MODE;
   process.env.AGENT_PEERS_WAKE_MODE = "log-only";
   handle = startBroker(TEST_PORT, TEST_DB, TEST_SECRET);
+  TEST_PORT = handle.server.port;
   testSecret = readFileSync(TEST_SECRET, "utf8").trim();
 });
 afterAll(() => {
@@ -123,6 +124,18 @@ test("same-TTY collision expires the old holder and preserves the new holder", a
   expect(staleSend.ok).toBe(false);
   expect(staleSend.error).toMatch(/^unauthorized sender:/);
   expect(staleSend.error).not.toContain(oldHolder.session_token);
+  expect(staleSend.error).not.toContain("must not land");
+
+  const machinePeers = await client.listPeers({
+    scope: "machine", cwd: "/any", git_root: null, peer_type: "codex",
+  });
+  const collisionProjection = machinePeers.find((peer) => peer.id === newHolder.id);
+  expect(collisionProjection).toBeDefined();
+  expect(collisionProjection?.id).toBe(newHolder.id);
+  expect(collisionProjection?.name).toBe(oldHolder.name);
+  expect(machinePeers.filter((peer) => peer.id === newHolder.id)).toHaveLength(1);
+  expect(Object.prototype.hasOwnProperty.call(collisionProjection!, "session_token")).toBe(false);
+  expect(Object.prototype.hasOwnProperty.call(collisionProjection!, "reclaim_token")).toBe(false);
 
   await client.heartbeat({ id: newHolder.id, session_token: newHolder.session_token });
   await client.setSummary({

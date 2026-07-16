@@ -52,6 +52,39 @@ test("non-401 transport failures do not trip AUTH_LOST", () => {
   expect(exitCodes).toEqual([]);
 });
 
+test("AUTH_LOST output never includes credentials or request payload context", () => {
+  const stderr: string[] = [];
+  const exitCodes: number[] = [];
+  const authLost = createAuthLostHandler({
+    component: "codex",
+    writeStderr: (line) => stderr.push(line),
+    exit: (code) => { exitCodes.push(code); },
+  });
+  const suspiciousToken = "token-should-not-emit";
+  const suspiciousMessage = "do-not-log-this-message-text";
+
+  expect(authLost.exitIfUnauthorizedSend({
+    ok: false,
+    error: `unauthorized sender: ${suspiciousToken} ${suspiciousMessage}`,
+  })).toBe(true);
+  expect(authLost.isLost()).toBe(true);
+  expect(exitCodes).toEqual([1]);
+  const payload = JSON.parse(stderr[0]!) as {
+    event: string;
+    component: string;
+    reason: string;
+    operation: string;
+  };
+  expect(payload).toEqual({
+    event: "AUTH_LOST",
+    component: "codex",
+    operation: "send_message",
+    reason: "unauthorized_sender",
+  });
+  expect(JSON.stringify(payload)).not.toContain(suspiciousToken);
+  expect(JSON.stringify(payload)).not.toContain(suspiciousMessage);
+});
+
 test("unauthorized send response trips the same structured AUTH_LOST path", () => {
   const stderr: string[] = [];
   const exitCodes: number[] = [];
