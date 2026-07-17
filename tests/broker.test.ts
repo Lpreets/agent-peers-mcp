@@ -18,7 +18,9 @@ import {
   listOrphanedMessages,
   SessionExpiredError,
 } from "../broker.ts";
+import * as broker from "../broker.ts";
 import type { Database } from "bun:sqlite";
+import { createHash, randomBytes } from "node:crypto";
 import { unlinkSync, existsSync } from "node:fs";
 
 let db: Database;
@@ -54,6 +56,178 @@ function reg(opts: {
     summary: opts.summary ?? "",
     ...(opts.name ? { name: opts.name } : {}),
   });
+}
+
+type BrokerRuntime = Record<string, unknown>;
+type IdentityRegisterResult = {
+  id?: string;
+  name?: string;
+  session_token?: string;
+  error?: string;
+};
+
+const brokerRuntime: BrokerRuntime = broker as BrokerRuntime;
+const HEARTBEAT_INTERVAL_NS = 30_000_000_000n;
+const LEASE_TTL_NS = 120_000_000_000n;
+const LEASE_MISS_LIMIT = 3n;
+const WALL_CLOCK_BASE = "2099-01-01T00:00:00.000Z";
+const WALL_CLOCK_PLUS_2H = "2099-01-01T02:00:00.000Z";
+
+function registerWithIdentity(req: Record<string, unknown>): IdentityRegisterResult {
+  const fn = brokerRuntime.registerPeer as ((db: Database, req: Record<string, unknown>) => IdentityRegisterResult) | undefined;
+  if (!fn) throw new Error("registerPeer export missing");
+  return fn(db, req);
+}
+
+function requireBrokerFn<T>(name: string): T | undefined {
+  return brokerRuntime[name] as T | undefined;
+}
+
+// Fixture-only verifier material. Assertions deliberately treat both fields as
+// opaque so this seed does not freeze a production verifier format/algorithm.
+function deriveCredentialVerifier(credential: string): { salt: string; verifier: string } {
+  const salt = randomBytes(16).toString("hex");
+  const verifier = createHash("sha256").update(salt).update("\0").update(credential).digest("hex");
+  return { salt, verifier };
+}
+
+function setIdentityChallenge(peerId: string, identityKey: string, credential: string, lastSeenISO: string): void {
+  ensurePeerColumns([
+    "stable_identity_key TEXT",
+    "authenticated_host_namespace TEXT",
+    "identity_epoch INTEGER",
+    "identity_state TEXT",
+    "credential_salt TEXT",
+    "credential_verifier TEXT",
+    "last_auth_method TEXT",
+  ]);
+  const { salt, verifier } = deriveCredentialVerifier(credential);
+  db.query(
+    `UPDATE peers
+       SET stable_identity_key = ?, authenticated_host_namespace = ?, identity_epoch = ?,
+           identity_state = ?, credential_salt = ?, credential_verifier = ?,
+           last_auth_method = ?, last_seen = ?
+       WHERE id = ?`
+  ).run(
+    identityKey,
+    "host:lpreet-pco",
+    7,
+    "current",
+    salt,
+    verifier,
+    "fresh_enrollment",
+    lastSeenISO,
+    peerId,
+  );
+}
+
+function ensurePeerColumns(columns: string[]): void {
+  const existing = new Set(
+    db.query<{ name: string }, []>("SELECT name FROM pragma_table_info('peers')").all().map((r) => r.name),
+  );
+  for (const col of columns) {
+    const name = col.split(/\s+/, 1)[0]!;
+    if (!existing.has(name)) {
+      db.exec(`ALTER TABLE peers ADD COLUMN ${col}`);
+      existing.add(name);
+    }
+  }
+}
+
+function ensureMessageColumns(columns: string[]): void {
+  const existing = new Set(
+    db.query<{ name: string }, []>("SELECT name FROM pragma_table_info('messages')").all().map((r) => r.name),
+  );
+  for (const col of columns) {
+    const name = col.split(/\s+/, 1)[0]!;
+    if (!existing.has(name)) {
+      db.exec(`ALTER TABLE messages ADD COLUMN ${col}`);
+      existing.add(name);
+    }
+  }
+}
+
+function setLeaseState(peerId: string, state: {
+  lastSeenMonoNs: bigint;
+  expiresMonoNs: bigint;
+  persistedMisses: number;
+  generation?: number;
+  ownerTokenHash?: string;
+  wallLastSeen?: string;
+}): void {
+  ensurePeerColumns([
+    "lease_last_seen_mono_ns INTEGER",
+    "lease_expires_mono_ns INTEGER",
+    "lease_consecutive_misses INTEGER",
+    "lease_generation INTEGER",
+    "lease_owner_token_hash TEXT",
+  ]);
+  db.query(
+    `UPDATE peers
+       SET lease_last_seen_mono_ns = ?, lease_expires_mono_ns = ?,
+           lease_consecutive_misses = ?, lease_generation = ?,
+           lease_owner_token_hash = ?, last_seen = ?
+     WHERE id = ?`
+  ).run(
+    state.lastSeenMonoNs.toString(),
+    state.expiresMonoNs.toString(),
+    state.persistedMisses,
+    state.generation ?? 11,
+    state.ownerTokenHash ?? "opaque-owner-token-hash",
+    state.wallLastSeen ?? WALL_CLOCK_PLUS_2H,
+    peerId,
+  );
+}
+
+function identityRequest(opts: {
+  name: string;
+  pid: number;
+  cwd: string;
+  identityKey: string;
+  credential?: string;
+  tty?: string | null;
+}): Record<string, unknown> {
+  return {
+    peer_type: "codex",
+    name: opts.name,
+    pid: opts.pid,
+    cwd: opts.cwd,
+    git_root: null,
+    tty: opts.tty ?? null,
+    summary: "",
+    stable_identity_key: opts.identityKey,
+    authenticated_host_namespace: "host:lpreet-pco",
+    ...(opts.credential === undefined ? {} : { credential_secret: opts.credential }),
+  };
+}
+
+function readLeaseState(peerId: string): {
+  lastSeenMonoNs: bigint;
+  expiresMonoNs: bigint;
+  misses: number;
+  generation: number;
+  ownerTokenHash: string | null;
+} {
+  const row = db.query<{
+    lease_last_seen_mono_ns: string;
+    lease_expires_mono_ns: string;
+    lease_consecutive_misses: number;
+    lease_generation: number;
+    lease_owner_token_hash: string | null;
+  }, [string]>(
+    `SELECT CAST(lease_last_seen_mono_ns AS TEXT) AS lease_last_seen_mono_ns,
+            CAST(lease_expires_mono_ns AS TEXT) AS lease_expires_mono_ns,
+            lease_consecutive_misses, lease_generation, lease_owner_token_hash
+       FROM peers WHERE id = ?`
+  ).get(peerId);
+  expect(row).not.toBeNull();
+  return {
+    lastSeenMonoNs: BigInt(row!.lease_last_seen_mono_ns),
+    expiresMonoNs: BigInt(row!.lease_expires_mono_ns),
+    misses: row!.lease_consecutive_misses,
+    generation: row!.lease_generation,
+    ownerTokenHash: row!.lease_owner_token_hash,
+  };
 }
 
 // ---------- schema ----------
@@ -436,6 +610,636 @@ test("registerPeer is atomic under simulated interleaving", () => {
   );
   const res = reg({ name: "race" });
   expect(res.name).toBe("race-2");
+});
+
+test("registerPeer rejects missing and wrong stale-reclaim credentials without owner mutation", () => {
+  const stale = reg({ name: "stale-unauthed", peer_type: "codex", cwd: "/cred", tty: null });
+  const original = db.query<{ session_token: string; pid: number }, [string]>(
+    "SELECT session_token, pid FROM peers WHERE id = ?"
+  ).get(stale.id);
+  expect(original).not.toBeNull();
+
+  const identity = "identity-key-stale";
+  const credential = "stale-secret";
+  setIdentityChallenge(stale.id, identity, credential, WALL_CLOCK_PLUS_2H);
+  const nowMonoNs = process.hrtime.bigint();
+  setLeaseState(stale.id, {
+    lastSeenMonoNs: nowMonoNs - (HEARTBEAT_INTERVAL_NS * LEASE_MISS_LIMIT),
+    expiresMonoNs: nowMonoNs - 1n,
+    persistedMisses: 0,
+  });
+
+  const stored = db.query<{ credential_salt: string; credential_verifier: string; stable_identity_key: string }, [string]>(
+    "SELECT stable_identity_key, credential_salt, credential_verifier FROM peers WHERE id = ?"
+  ).get(stale.id);
+  expect(stored?.stable_identity_key).toBe(identity);
+  expect(stored?.credential_salt).not.toContain(identity);
+  expect(stored?.credential_salt).not.toContain(credential);
+  expect(stored?.credential_verifier).not.toBe(credential);
+  expect(stored?.credential_verifier).not.toContain(credential);
+  const peerColumns = db.query<{ name: string }, []>("SELECT name FROM pragma_table_info('peers')").all();
+  expect(peerColumns.map(({ name }) => name)).not.toContain("reclaim_credential");
+
+  const missing = registerWithIdentity(identityRequest({
+    name: "stale-unauthed",
+    pid: 902,
+    cwd: "/cred",
+    identityKey: identity,
+  }));
+  expect(missing.error).toBe("IDENTITY_CREDENTIAL_REQUIRED");
+
+  const wrong = registerWithIdentity(identityRequest({
+    name: "stale-unauthed",
+    pid: 903,
+    cwd: "/cred",
+    identityKey: identity,
+    credential: "wrong-secret",
+  }));
+  expect(wrong.error).toBe("IDENTITY_CREDENTIAL_INVALID");
+
+  const after = db.query<{ session_token: string; pid: number }, [string]>(
+    "SELECT session_token, pid FROM peers WHERE id = ?"
+  ).get(stale.id);
+  expect(after?.session_token).toBe(original!.session_token);
+  expect(after?.pid).toBe(original!.pid);
+  expect(db.query<{ c: number }, []>("SELECT COUNT(*) AS c FROM peers WHERE name = 'stale-unauthed'").get()?.c).toBe(1);
+});
+
+test("registerPeer rejects reclaim against a live owner with a valid credential", () => {
+  const live = reg({ name: "live-identity", peer_type: "codex", cwd: "/cred", tty: null });
+  const identity = "identity-live-key";
+  const credential = "live-secret";
+  setIdentityChallenge(live.id, identity, credential, WALL_CLOCK_PLUS_2H);
+  const nowMonoNs = process.hrtime.bigint();
+  setLeaseState(live.id, {
+    lastSeenMonoNs: nowMonoNs,
+    expiresMonoNs: nowMonoNs + LEASE_TTL_NS,
+    persistedMisses: 0,
+  });
+
+  const result = registerWithIdentity(identityRequest({
+    name: "live-identity",
+    pid: 903,
+    cwd: "/cred",
+    identityKey: identity,
+    credential,
+  }));
+  expect(result.error).toBe("IDENTITY_LIVE_OWNER");
+  const rowCount = db.query<{ c: number }, []>(
+    "SELECT COUNT(*) AS c FROM peers WHERE name LIKE 'live-identity%'"
+  ).get()!;
+  expect(rowCount.c).toBe(1);
+});
+
+test("two concurrent stale reclaim attempts produce one winner and one typed loser", () => {
+  const stale = reg({ name: "stale-race", peer_type: "codex", cwd: "/cred-race", tty: null });
+  const identity = "identity-race";
+  const credential = "race-secret";
+  setIdentityChallenge(stale.id, identity, credential, WALL_CLOCK_PLUS_2H);
+  const nowMonoNs = process.hrtime.bigint();
+  setLeaseState(stale.id, {
+    lastSeenMonoNs: nowMonoNs - (HEARTBEAT_INTERVAL_NS * LEASE_MISS_LIMIT),
+    expiresMonoNs: nowMonoNs - 1n,
+    persistedMisses: 0,
+  });
+  const before = db.query<{ session_token: string; identity_epoch: number }, [string]>(
+    "SELECT session_token, identity_epoch FROM peers WHERE id = ?"
+  ).get(stale.id)!;
+
+  const winner = registerWithIdentity(identityRequest({
+    name: "stale-race",
+    pid: 904,
+    cwd: "/cred-race",
+    identityKey: identity,
+    credential,
+  }));
+  const loser = registerWithIdentity(identityRequest({
+    name: "stale-race",
+    pid: 905,
+    cwd: "/cred-race",
+    identityKey: identity,
+    credential,
+  }));
+
+  expect(loser.error).toBe("IDENTITY_RECLAIM_RACE_LOST");
+  expect(winner.error).toBeUndefined();
+  expect(winner.id).toBe(stale.id);
+  const after = db.query<{ session_token: string; identity_epoch: number }, [string]>(
+    "SELECT session_token, identity_epoch FROM peers WHERE id = ?"
+  ).get(stale.id)!;
+  expect(after.session_token).toBe(winner.session_token!);
+  expect(after.session_token).not.toBe(before.session_token);
+  expect(after.identity_epoch).toBe(before.identity_epoch + 1);
+});
+
+test("same tty and cwd cannot replace a live identity owner", () => {
+  const live = reg({ name: "live-tty", peer_type: "codex", cwd: "/tty", tty: "pts/7" });
+  const identity = "identity-tty";
+  const credential = "tty-secret";
+  setIdentityChallenge(live.id, identity, credential, WALL_CLOCK_PLUS_2H);
+  const nowMonoNs = process.hrtime.bigint();
+  setLeaseState(live.id, {
+    lastSeenMonoNs: nowMonoNs,
+    expiresMonoNs: nowMonoNs + LEASE_TTL_NS,
+    persistedMisses: 0,
+  });
+  const before = db.query<{ session_token: string; pid: number }, [string]>(
+    "SELECT session_token, pid FROM peers WHERE id = ?"
+  ).get(live.id)!;
+
+  const result = registerWithIdentity(identityRequest({
+    name: "live-tty",
+    pid: 906,
+    cwd: "/tty",
+    tty: "pts/7",
+    identityKey: identity,
+    credential,
+  }));
+  expect(result.error).toBe("IDENTITY_LIVE_OWNER");
+
+  const row = db.query<{ session_token: string; pid: number }, [string]>(
+    "SELECT session_token, pid FROM peers WHERE id = ?"
+  ).get(live.id);
+  expect(row).toEqual(before);
+});
+
+test("release-seat clears only the authenticated owner lease and increments its generation", () => {
+  const releaseSeat = requireBrokerFn<(db: Database, req: {
+    id: string;
+    session_token: string;
+    credential_secret: string;
+    stable_identity_key: string;
+    authenticated_host_namespace: string;
+    lease_owner_token: string;
+  }) => { ok: boolean; lease_generation?: number }>("releaseSeat");
+  expect(typeof releaseSeat).toBe("function");
+  if (!releaseSeat) return;
+
+  const owner = reg({ name: "release-seat-owner", peer_type: "codex", cwd: "/release", tty: "pts/8" });
+  const identity = "release-seat-identity";
+  const credential = "release-seat-secret";
+  setIdentityChallenge(owner.id, identity, credential, WALL_CLOCK_PLUS_2H);
+  const nowMonoNs = process.hrtime.bigint();
+  setLeaseState(owner.id, {
+    lastSeenMonoNs: nowMonoNs,
+    expiresMonoNs: nowMonoNs + LEASE_TTL_NS,
+    persistedMisses: 2,
+    generation: 41,
+    ownerTokenHash: createHash("sha256").update("owner-token").digest("hex"),
+  });
+
+  const unaffected = reg({ name: "other-peer", peer_type: "codex", cwd: "/release", tty: "pts/9" });
+
+  const result = releaseSeat(db, {
+    id: owner.id,
+    session_token: owner.session_token,
+    credential_secret: credential,
+    stable_identity_key: identity,
+    authenticated_host_namespace: "host:lpreet-pco",
+    lease_owner_token: "owner-token",
+  });
+  expect(result.ok).toBe(true);
+
+  const ownerRow = db.query<{ lease_generation: number; lease_owner_token_hash: string | null; lease_consecutive_misses: number } , [string]>("SELECT lease_generation, lease_owner_token_hash, lease_consecutive_misses FROM peers WHERE id = ?").get(owner.id);
+  const otherRow = db.query<{ lease_generation: number | null; lease_owner_token_hash: string | null } , [string]>("SELECT lease_generation, lease_owner_token_hash FROM peers WHERE id = ?").get(unaffected.id);
+  expect(ownerRow?.lease_generation).toBe(42);
+  expect(ownerRow?.lease_owner_token_hash).toBeNull();
+  expect(ownerRow?.lease_consecutive_misses).toBe(0);
+  expect(otherRow?.lease_generation ?? null).toBeNull();
+  expect(otherRow?.lease_owner_token_hash ?? null).toBeNull();
+});
+
+test("background heartbeat receipts keep ownership live during a slow no-model-turn window", async () => {
+  const owner = reg({ name: "slow-turn-owner", peer_type: "codex", cwd: "/lease", tty: null });
+  const identity = "identity-slow-turn";
+  const credential = "slow-turn-secret";
+  setIdentityChallenge(owner.id, identity, credential, WALL_CLOCK_BASE);
+  const capturedMonoNs = process.hrtime.bigint();
+  setLeaseState(owner.id, {
+    lastSeenMonoNs: capturedMonoNs - (HEARTBEAT_INTERVAL_NS * 2n),
+    expiresMonoNs: capturedMonoNs + HEARTBEAT_INTERVAL_NS,
+    persistedMisses: 2,
+    generation: 23,
+    ownerTokenHash: "slow-turn-owner-token-hash",
+    wallLastSeen: WALL_CLOCK_BASE,
+  });
+
+  // Only the dedicated heartbeat boundary runs across this simulated slow turn:
+  // no poll, summary, rename, or other model-mediated broker call refreshes it.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  heartbeatPeer(db, owner.id, owner.session_token);
+  const first = readLeaseState(owner.id);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  heartbeatPeer(db, owner.id, owner.session_token);
+  const second = readLeaseState(owner.id);
+
+  expect(first.lastSeenMonoNs).toBeGreaterThan(capturedMonoNs);
+  expect(first.expiresMonoNs - first.lastSeenMonoNs).toBe(LEASE_TTL_NS);
+  expect(first.misses).toBe(0);
+  expect(second.lastSeenMonoNs).toBeGreaterThanOrEqual(first.lastSeenMonoNs);
+  expect(second.expiresMonoNs).toBeGreaterThanOrEqual(first.expiresMonoNs);
+  expect(second.generation).toBe(23);
+  expect(second.ownerTokenHash).toBe("slow-turn-owner-token-hash");
+
+  const reclaim = registerWithIdentity(identityRequest({
+    name: owner.name,
+    pid: 907,
+    cwd: "/lease",
+    identityKey: identity,
+    credential,
+  }));
+  expect(reclaim.error).toBe("IDENTITY_LIVE_OWNER");
+});
+
+test("lease truth table: miss limit alone keeps the owner live without a sweep", () => {
+  const owner = reg({ name: "lease-misses-only", peer_type: "codex", cwd: "/lease", tty: null });
+  const identity = "identity-misses-only";
+  const credential = "misses-only-secret";
+  setIdentityChallenge(owner.id, identity, credential, WALL_CLOCK_PLUS_2H);
+  const nowMonoNs = process.hrtime.bigint();
+  setLeaseState(owner.id, {
+    lastSeenMonoNs: nowMonoNs - (HEARTBEAT_INTERVAL_NS * LEASE_MISS_LIMIT),
+    expiresMonoNs: nowMonoNs + HEARTBEAT_INTERVAL_NS,
+    persistedMisses: 0,
+  });
+
+  // No gc/miss-sweep call: reclaim must compute misses inline, then apply AND.
+  const result = registerWithIdentity(identityRequest({
+    name: owner.name,
+    pid: 908,
+    cwd: "/lease",
+    identityKey: identity,
+    credential,
+  }));
+  expect(result.error).toBe("IDENTITY_LIVE_OWNER");
+  expect(db.query<{ session_token: string }, [string]>("SELECT session_token FROM peers WHERE id = ?").get(owner.id)?.session_token)
+    .toBe(owner.session_token);
+});
+
+test("lease truth table: expiry alone keeps the owner live despite two-hour advisory timestamp skew", () => {
+  const owner = reg({ name: "lease-expiry-only", peer_type: "codex", cwd: "/lease", tty: null });
+  const sender = reg({ name: "lease-wall-clock-sender", peer_type: "claude", cwd: "/lease" });
+  const identity = "identity-expiry-only";
+  const credential = "expiry-only-secret";
+  setIdentityChallenge(owner.id, identity, credential, WALL_CLOCK_PLUS_2H);
+  const nowMonoNs = process.hrtime.bigint();
+  setLeaseState(owner.id, {
+    lastSeenMonoNs: nowMonoNs - (HEARTBEAT_INTERVAL_NS * 2n),
+    expiresMonoNs: nowMonoNs - 1n,
+    persistedMisses: Number(LEASE_MISS_LIMIT),
+  });
+  expect(sendMessage(db, {
+    from_id: sender.id,
+    session_token: sender.session_token,
+    to_id_or_name: owner.id,
+    text: "advisory-sent-at-does-not-authorize",
+  }).ok).toBe(true);
+  db.query("UPDATE messages SET sent_at = ? WHERE to_id = ?")
+    .run(WALL_CLOCK_BASE, owner.id);
+
+  const result = registerWithIdentity(identityRequest({
+    name: owner.name,
+    pid: 909,
+    cwd: "/lease",
+    identityKey: identity,
+    credential,
+  }));
+  expect(result.error).toBe("IDENTITY_LIVE_OWNER");
+  expect(db.query<{ session_token: string }, [string]>("SELECT session_token FROM peers WHERE id = ?").get(owner.id)?.session_token)
+    .toBe(owner.session_token);
+});
+
+test("lease truth table: reclaim succeeds inline only after miss limit and expiry both cross", () => {
+  const owner = reg({ name: "lease-both-stale", peer_type: "codex", cwd: "/lease", tty: null });
+  const sender = reg({ name: "lease-both-stale-sender", peer_type: "claude", cwd: "/lease" });
+  const identity = "identity-both-stale";
+  const credential = "both-stale-secret";
+  setIdentityChallenge(owner.id, identity, credential, WALL_CLOCK_PLUS_2H);
+  const nowMonoNs = process.hrtime.bigint();
+  setLeaseState(owner.id, {
+    lastSeenMonoNs: nowMonoNs - (HEARTBEAT_INTERVAL_NS * LEASE_MISS_LIMIT),
+    expiresMonoNs: nowMonoNs - 1n,
+    persistedMisses: 0,
+  });
+  expect(sendMessage(db, {
+    from_id: sender.id,
+    session_token: sender.session_token,
+    to_id_or_name: owner.id,
+    text: "both-stale-advisory-sent-at",
+  }).ok).toBe(true);
+  db.query("UPDATE messages SET sent_at = ? WHERE to_id = ?")
+    .run(WALL_CLOCK_BASE, owner.id);
+
+  // No sweep updates persistedMisses. The +2h last_seen/sent_at disagreement
+  // is advisory; the monotonic receipt/deadline pair alone makes this stale.
+  const result = registerWithIdentity(identityRequest({
+    name: owner.name,
+    pid: 910,
+    cwd: "/lease",
+    identityKey: identity,
+    credential,
+  }));
+  expect(result.error).toBeUndefined();
+  expect(result.id).toBe(owner.id);
+  expect(result.session_token).not.toBe(owner.session_token);
+});
+
+test("duplicate heartbeat receipts are deterministic and do not rotate lease ownership", () => {
+  const owner = reg({ name: "duplicate-heartbeat", peer_type: "codex", cwd: "/heartbeat", tty: null });
+  setIdentityChallenge(owner.id, "identity-duplicate-heartbeat", "duplicate-heartbeat-secret", WALL_CLOCK_PLUS_2H);
+  const nowMonoNs = process.hrtime.bigint();
+  setLeaseState(owner.id, {
+    lastSeenMonoNs: nowMonoNs - HEARTBEAT_INTERVAL_NS,
+    expiresMonoNs: nowMonoNs + LEASE_TTL_NS,
+    persistedMisses: 1,
+    generation: 29,
+    ownerTokenHash: "duplicate-owner-token-hash",
+  });
+
+  expect(() => heartbeatPeer(db, owner.id, owner.session_token)).not.toThrow();
+  const first = readLeaseState(owner.id);
+  expect(() => heartbeatPeer(db, owner.id, owner.session_token)).not.toThrow();
+  const duplicate = readLeaseState(owner.id);
+
+  expect(first.misses).toBe(0);
+  expect(duplicate.misses).toBe(0);
+  expect(duplicate.generation).toBe(first.generation);
+  expect(duplicate.generation).toBe(29);
+  expect(duplicate.ownerTokenHash).toBe(first.ownerTokenHash);
+  expect(duplicate.ownerTokenHash).toBe("duplicate-owner-token-hash");
+  expect(duplicate.lastSeenMonoNs).toBeGreaterThanOrEqual(first.lastSeenMonoNs);
+  expect(duplicate.expiresMonoNs).toBeGreaterThanOrEqual(first.expiresMonoNs);
+  expect(pollMessages(db, owner.id, owner.session_token)).toEqual([]);
+});
+
+test("broker restart advances persisted broker_epoch and rejects stale lease tokens", () => {
+  ensurePeerColumns([
+    "broker_epoch INTEGER",
+    "lease_owner_token_hash TEXT",
+    "stable_identity_key TEXT",
+    "credential_salt TEXT",
+    "credential_verifier TEXT",
+  ]);
+  const owner = reg({ name: "epoch-peer", peer_type: "codex", cwd: "/epoch", tty: "pts/12" });
+  const identity = "identity-epoch";
+  const credential = "epoch-secret";
+  setIdentityChallenge(owner.id, identity, credential, WALL_CLOCK_PLUS_2H);
+  db.query("UPDATE peers SET broker_epoch = 1, lease_owner_token_hash = ? WHERE id = ?").run("stale-owner-token", owner.id);
+
+  const initialEpoch = db.query<{ broker_epoch: number }, [string]>(
+    "SELECT broker_epoch FROM peers WHERE id = ?"
+  ).get(owner.id)?.broker_epoch;
+  expect(initialEpoch).toBe(1);
+
+  db.close();
+  db = initDb(TEST_DB);
+  const epochNow = db.query<{ broker_epoch: number }, [string]>(
+    "SELECT broker_epoch FROM peers WHERE id = ?"
+  ).get(owner.id)?.broker_epoch;
+  expect(epochNow).toBeGreaterThan(1);
+
+  const staleOwnerResult = registerWithIdentity(identityRequest({
+    name: "epoch-peer",
+    pid: 1210,
+    cwd: "/epoch",
+    tty: "pts/12",
+    identityKey: identity,
+    credential,
+  }));
+  expect(staleOwnerResult.error).toBe("IDENTITY_LEASE_EPOCH_STALE");
+});
+
+test("send-time sender snapshots stay immutable and poll reports transitioned after authenticated reclaim", () => {
+  ensureMessageColumns([
+    "provenance_version TEXT",
+    "sender_epoch_at_send INTEGER",
+    "sender_stable_identity_key_at_send TEXT",
+    "sender_authenticated_host_namespace_at_send TEXT",
+    "sender_name_at_send TEXT",
+    "sender_peer_type_at_send TEXT",
+    "sender_cwd_at_send TEXT",
+    "sender_summary_at_send TEXT",
+  ]);
+  const sender = reg({
+    name: "snapshot-sender",
+    peer_type: "claude",
+    cwd: "/snap",
+    tty: null,
+    summary: "sender-at-send",
+  });
+  const senderIdentity = "identity-snapshot-sender";
+  const senderCredential = "snapshot-sender-secret";
+  setIdentityChallenge(sender.id, senderIdentity, senderCredential, WALL_CLOCK_PLUS_2H);
+  const receiver = reg({
+    name: "snapshot-receiver",
+    peer_type: "codex",
+    cwd: "/snap",
+    tty: "pts/3",
+    summary: "receiver-first",
+  });
+
+  expect(sendMessage(db, {
+    from_id: sender.id,
+    session_token: sender.session_token,
+    to_id_or_name: receiver.name,
+    text: "immutable-snapshot",
+  }).ok).toBe(true);
+
+  const stored = db.query<{
+    provenance_version: string | null;
+    sender_epoch_at_send: number | null;
+    sender_stable_identity_key_at_send: string | null;
+    sender_authenticated_host_namespace_at_send: string | null;
+    sender_name_at_send: string | null;
+    sender_peer_type_at_send: string | null;
+    sender_cwd_at_send: string | null;
+    sender_summary_at_send: string | null;
+  }, [string]>(
+    `SELECT provenance_version, sender_epoch_at_send,
+            sender_stable_identity_key_at_send, sender_authenticated_host_namespace_at_send,
+            sender_name_at_send, sender_peer_type_at_send,
+            sender_cwd_at_send, sender_summary_at_send
+       FROM messages WHERE text = ?`
+  ).get("immutable-snapshot")!;
+  expect(stored.provenance_version).not.toBeNull();
+  expect(stored.sender_epoch_at_send).toBe(7);
+  expect(stored.sender_stable_identity_key_at_send).toBe(senderIdentity);
+  expect(stored.sender_authenticated_host_namespace_at_send).toBe("host:lpreet-pco");
+  expect(stored.sender_name_at_send).toBe("snapshot-sender");
+  expect(stored.sender_peer_type_at_send).toBe("claude");
+  expect(stored.sender_cwd_at_send).toBe("/snap");
+  expect(stored.sender_summary_at_send).toBe("sender-at-send");
+
+  const nowMonoNs = process.hrtime.bigint();
+  setLeaseState(sender.id, {
+    lastSeenMonoNs: nowMonoNs - (HEARTBEAT_INTERVAL_NS * LEASE_MISS_LIMIT),
+    expiresMonoNs: nowMonoNs - 1n,
+    persistedMisses: 0,
+  });
+  const reclaimedSender = registerWithIdentity({
+    ...identityRequest({
+      name: sender.name,
+      pid: 1203,
+      cwd: "/snapshot-modified",
+      identityKey: senderIdentity,
+      credential: senderCredential,
+    }),
+    peer_type: "claude",
+    summary: "sender-after-send",
+  });
+  expect(reclaimedSender.error).toBeUndefined();
+  expect(reclaimedSender.id).toBe(sender.id);
+  expect(reclaimedSender.session_token).not.toBe(sender.session_token);
+  expect(renamePeer(db, {
+    id: sender.id,
+    session_token: reclaimedSender.session_token!,
+    new_name: "snapshot-sender-renamed",
+  }).ok).toBe(true);
+
+  const inbox = pollMessages(db, receiver.id, receiver.session_token);
+  expect(inbox).toHaveLength(1);
+  const message = inbox[0]! as typeof inbox[number] & { sender_registry_state?: string };
+  expect(message.from_name).toBe("snapshot-sender");
+  expect(message.from_summary).toBe("sender-at-send");
+  expect(message.from_peer_type).toBe("claude");
+  expect(message.from_cwd).toBe("/snap");
+  expect(message.sender_registry_state).toBe("transitioned");
+});
+
+test("credentialed stale reclaim preserves the addressed UUID and unread backlog", () => {
+  const owner = reg({ name: "credentialed-backlog", peer_type: "codex", cwd: "/backlog", tty: null });
+  const sender = reg({ name: "credentialed-backlog-sender", peer_type: "claude", cwd: "/backlog" });
+  const identity = "identity-credentialed-backlog";
+  const credential = "credentialed-backlog-secret";
+  setIdentityChallenge(owner.id, identity, credential, WALL_CLOCK_PLUS_2H);
+  expect(sendMessage(db, {
+    from_id: sender.id,
+    session_token: sender.session_token,
+    to_id_or_name: owner.name,
+    text: "addressed-before-authenticated-reclaim",
+  }).ok).toBe(true);
+
+  const before = db.query<{ session_token: string; identity_epoch: number }, [string]>(
+    "SELECT session_token, identity_epoch FROM peers WHERE id = ?"
+  ).get(owner.id)!;
+  const nowMonoNs = process.hrtime.bigint();
+  setLeaseState(owner.id, {
+    lastSeenMonoNs: nowMonoNs - (HEARTBEAT_INTERVAL_NS * LEASE_MISS_LIMIT),
+    expiresMonoNs: nowMonoNs - 1n,
+    persistedMisses: 0,
+  });
+
+  const reclaimed = registerWithIdentity(identityRequest({
+    name: owner.name,
+    pid: 1204,
+    cwd: "/backlog",
+    identityKey: identity,
+    credential,
+  }));
+  expect(reclaimed.error).toBeUndefined();
+  expect(reclaimed.id).toBe(owner.id);
+  expect(reclaimed.session_token).not.toBe(before.session_token);
+
+  const after = db.query<{ identity_epoch: number; last_auth_method: string }, [string]>(
+    "SELECT identity_epoch, last_auth_method FROM peers WHERE id = ?"
+  ).get(owner.id)!;
+  expect(after.identity_epoch).toBe(before.identity_epoch + 1);
+  expect(after.last_auth_method).toBe("authenticated_reclaim");
+  expect(db.query<{ c: number }, [string]>(
+    "SELECT COUNT(*) AS c FROM messages WHERE to_id = ? AND acked = 0"
+  ).get(owner.id)?.c).toBe(1);
+
+  const inbox = pollMessages(db, reclaimed.id!, reclaimed.session_token!);
+  expect(inbox.map(({ text }) => text)).toEqual(["addressed-before-authenticated-reclaim"]);
+});
+
+test("forced-fresh quarantines backlog and appends a token-free transition receipt", () => {
+  const forceFresh = requireBrokerFn<(db: Database, req: Record<string, unknown>) => {
+    ok: boolean;
+    new_peer_id?: string;
+    error?: string;
+  }>("forceFresh");
+  expect(typeof forceFresh).toBe("function");
+  if (!forceFresh) return;
+
+  ensurePeerColumns(["identity_state TEXT", "identity_epoch INTEGER"]);
+  const old = reg({ name: "forced-fresh-owner", peer_type: "codex", cwd: "/forced", tty: "pts/20" });
+  const sender = reg({ name: "forced-fresh-sender", peer_type: "claude" });
+  const plantedCredential = "PLANTED_CREDENTIAL_MUST_NOT_LEAK_7f4c";
+  const plantedGrant = "PLANTED_ONE_TIME_GRANT_MUST_NOT_LEAK_91aa";
+  const plantedBody = "PLANTED_MESSAGE_BODY_MUST_NOT_LEAK_3d2e";
+  expect(sendMessage(db, {
+    from_id: sender.id,
+    session_token: sender.session_token,
+    to_id_or_name: old.name,
+    text: plantedBody,
+  }).ok).toBe(true);
+
+  const request: Record<string, unknown> = {
+    peer_type: "codex",
+    name: old.name,
+    host: "lpreet-pco",
+    authenticated_host_namespace: "host:lpreet-pco",
+    reason: "S337 deterministic RED contract",
+    credential_secret: plantedCredential,
+    stable_identity_key: "forced-fresh-new-identity",
+    operator_grant: plantedGrant,
+  };
+  const result = forceFresh(db, request);
+  expect(result.ok).toBe(true);
+  expect(result.new_peer_id).toBeDefined();
+  expect(result.new_peer_id).not.toBe(old.id);
+
+  const oldRow = db.query<{ identity_state: string }, [string]>("SELECT identity_state FROM peers WHERE id = ?").get(old.id);
+  expect(oldRow?.identity_state).toBe("quarantined");
+  const inherited = db.query<{ c: number }, [string, string]>(
+    "SELECT COUNT(*) AS c FROM messages WHERE to_id = ? AND text = ?"
+  ).get(result.new_peer_id!, plantedBody);
+  expect(inherited?.c).toBe(0);
+  const quarantined = db.query<{ c: number }, [string, string]>(
+    "SELECT COUNT(*) AS c FROM messages WHERE to_id = ? AND text = ?"
+  ).get(old.id, plantedBody);
+  expect(quarantined?.c).toBe(1);
+
+  const transitionColumns = db.query<{ name: string }, []>(
+    "SELECT name FROM pragma_table_info('identity_transitions')"
+  ).all().map(({ name }) => name);
+  expect(transitionColumns.length).toBeGreaterThan(0);
+  expect(transitionColumns.some((name) => /token|credential|verifier|salt|secret|body/i.test(name))).toBe(false);
+
+  const receiptsBeforeReplay = db.query<Record<string, string | number | null>, []>(
+    "SELECT * FROM identity_transitions ORDER BY rowid"
+  ).all();
+  expect(receiptsBeforeReplay.length).toBeGreaterThan(0);
+  const firstReceipt = receiptsBeforeReplay[0]!;
+  const firstReceiptText = JSON.stringify(firstReceipt);
+  expect(firstReceiptText).toContain(old.id);
+  expect(firstReceiptText).toContain(result.new_peer_id!);
+  expect(firstReceiptText).toContain("forced_fresh");
+  expect(firstReceiptText).toContain("quarantined_not_inherited");
+  for (const plantedSecret of [
+    plantedCredential,
+    plantedGrant,
+    plantedBody,
+    old.session_token,
+  ]) {
+    expect(firstReceiptText).not.toContain(plantedSecret);
+  }
+
+  const replay = forceFresh(db, request);
+  expect(replay.ok).toBe(false);
+  expect(replay.error).toBe("IDENTITY_FORCED_FRESH_GRANT_REPLAYED");
+  const receiptsAfterReplay = db.query<Record<string, string | number | null>, []>(
+    "SELECT * FROM identity_transitions ORDER BY rowid"
+  ).all();
+  expect(receiptsAfterReplay[0]).toEqual(firstReceipt);
+  for (const receipt of receiptsAfterReplay) {
+    const serialized = JSON.stringify(receipt);
+    expect(serialized).not.toContain(plantedCredential);
+    expect(serialized).not.toContain(plantedGrant);
+    expect(serialized).not.toContain(plantedBody);
+    expect(serialized).not.toContain(old.session_token);
+  }
 });
 
 test("heartbeatPeer bumps last_seen with valid token", async () => {

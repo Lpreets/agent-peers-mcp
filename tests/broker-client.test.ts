@@ -4,7 +4,9 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { startBroker } from "../broker.ts";
 import {
   BrokerHttpError,
+  SECRET_HEADER,
   createClient,
+  isPreCommitBrokerUnavailable,
   isSessionExpiredError,
 } from "../shared/broker-client.ts";
 import { chmodSync, readFileSync, unlinkSync, existsSync, writeFileSync } from "node:fs";
@@ -16,10 +18,149 @@ let handle: ReturnType<typeof startBroker>;
 let testSecret: string;
 let previousWakeMode: string | undefined;
 
+const HOST_NAMESPACE_HEADER = "X-Agent-Host-Namespace";
+const HOST_ATTESTATION_HEADER = "X-Agent-Host-Attestation";
+const HOST_NONCE_HEADER = "X-Agent-Host-Nonce";
+const HOST_TIMESTAMP_HEADER = "X-Agent-Host-Timestamp";
+
+type TypedHttpResponse = {
+  status: number;
+  code: string | null;
+  error: string;
+};
+
+async function readTypedHttpResponse(res: Response): Promise<TypedHttpResponse> {
+  const raw = await res.text();
+  try {
+    const parsed = JSON.parse(raw) as { error?: string; code?: string };
+    return {
+      status: res.status,
+      code: typeof parsed.code === "string" ? parsed.code : null,
+      error: typeof parsed.error === "string" ? parsed.error : raw,
+    };
+  } catch {
+    return { status: res.status, code: null, error: raw };
+  }
+}
+
+async function postRegisterWithAttestation(params: {
+  namespace: string;
+  attestation: string;
+  nonce: string;
+  timestamp: string;
+  host?: string;
+  bodyNamespaceOverride?: string;
+}): Promise<Response> {
+  return fetch(`http://127.0.0.1:${TEST_PORT}/register`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      [SECRET_HEADER]: testSecret,
+      [HOST_NAMESPACE_HEADER]: params.namespace,
+      [HOST_ATTESTATION_HEADER]: params.attestation,
+      [HOST_NONCE_HEADER]: params.nonce,
+      [HOST_TIMESTAMP_HEADER]: params.timestamp,
+    },
+    body: JSON.stringify({
+      peer_type: "claude",
+      host: params.host ?? "lpreet-pco",
+      pid: 88,
+      cwd: "/host-attest",
+      git_root: null,
+      tty: null,
+      summary: "attestation",
+      name: `host-attest-${params.nonce}`,
+      ...(params.bodyNamespaceOverride === undefined
+        ? {}
+        : {
+            authenticated_host_namespace: params.bodyNamespaceOverride,
+            host_auth_method: "json-override-must-not-win",
+          }),
+    }),
+  });
+}
+
+async function postPeerQueue(body: Record<string, unknown>): Promise<Response> {
+  return fetch(`http://127.0.0.1:${TEST_PORT}/peer/queue`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      [SECRET_HEADER]: testSecret,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+function tableRowCount(table: "peers" | "messages" | "identity_transitions"): number | null {
+  const exists = handle.db.query<{ present: number }, [string]>(
+    "SELECT COUNT(*) AS present FROM sqlite_master WHERE type = 'table' AND name = ?"
+  ).get(table)?.present ?? 0;
+  if (exists === 0) return null;
+  return handle.db.query<{ count: number }, []>(
+    `SELECT COUNT(*) AS count FROM ${table}`
+  ).get()!.count;
+}
+
+function safePeerSnapshot(peerId: string): Record<string, unknown> | null {
+  const safeColumns = [
+    "id",
+    "name",
+    "peer_type",
+    "host",
+    "pid",
+    "cwd",
+    "git_root",
+    "tty",
+    "summary",
+    "registered_at",
+    "last_seen",
+    "stable_identity_key",
+    "authenticated_host_namespace",
+    "host_auth_method",
+    "identity_epoch",
+    "identity_state",
+    "lease_generation",
+    "broker_epoch",
+    "lease_last_seen_mono_ns",
+    "lease_expires_mono_ns",
+    "lease_consecutive_misses",
+    "last_auth_method",
+    "sender_registry_state",
+  ];
+  const available = new Set(handle.db.query<{ name: string }, []>(
+    "SELECT name FROM pragma_table_info('peers')"
+  ).all().map(({ name }) => name));
+  const projection = safeColumns.filter((name) => available.has(name));
+  return handle.db.query<Record<string, unknown>, [string]>(
+    `SELECT ${projection.join(", ")} FROM peers WHERE id = ?`
+  ).get(peerId) ?? null;
+}
+
+function brokerMutationSnapshot(peerId: string) {
+  return {
+    peer: safePeerSnapshot(peerId),
+    messages: tableRowCount("messages"),
+    identityTransitions: tableRowCount("identity_transitions"),
+  };
+}
+
+type CapturedOutcome<T> =
+  | { kind: "result"; value: T }
+  | { kind: "error"; error: unknown };
+
+async function captureOutcome<T>(run: () => Promise<T>): Promise<CapturedOutcome<T>> {
+  try {
+    return { kind: "result", value: await run() };
+  } catch (error) {
+    return { kind: "error", error };
+  }
+}
+
 beforeAll(() => {
   previousWakeMode = process.env.AGENT_PEERS_WAKE_MODE;
   process.env.AGENT_PEERS_WAKE_MODE = "log-only";
   handle = startBroker(TEST_PORT, TEST_DB, TEST_SECRET);
+  if (handle.server.port === undefined) throw new Error("test broker did not bind a port");
   TEST_PORT = handle.server.port;
   testSecret = readFileSync(TEST_SECRET, "utf8").trim();
 });
@@ -290,4 +431,347 @@ test("broker non-loopback health omits pid details", async () => {
     nonLoopback.db.close();
     for (const p of [db, secret]) if (existsSync(p)) unlinkSync(p);
   }
+});
+
+test("broker-client blocks JSON namespace override mismatches at the raw host-attestation boundary", async () => {
+  const beforePeerCount = tableRowCount("peers");
+  const bad = await postRegisterWithAttestation({
+    namespace: "tenant-a",
+    host: "tenant-a",
+    attestation: "bogus",
+    nonce: `ns-mismatch-${Math.random().toString(36).slice(2)}`,
+    timestamp: String(Math.floor(Date.now() / 1000)),
+    bodyNamespaceOverride: "tenant-b",
+  });
+  const observed = await readTypedHttpResponse(bad);
+  expect({
+    status: observed.status,
+    code: observed.code,
+    peerCountDelta: (tableRowCount("peers") ?? 0) - (beforePeerCount ?? 0),
+  }).toEqual({
+    status: 401,
+    code: "IDENTITY_HOST_NAMESPACE_MISMATCH",
+    peerCountDelta: 0,
+  });
+});
+
+test("PARTIAL boundary rejection: duplicate bogus host attestations never enroll; valid replay awaits Stage-B verifier injection", async () => {
+  const nonce = `replay-${Math.random().toString(36).slice(2)}`;
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const beforePeerCount = tableRowCount("peers");
+  const first = await postRegisterWithAttestation({
+    namespace: "tenant-a",
+    attestation: "bogus",
+    nonce,
+    timestamp,
+  });
+  const second = await postRegisterWithAttestation({
+    namespace: "tenant-a",
+    attestation: "bogus",
+    nonce,
+    timestamp,
+  });
+  const [firstObserved, secondObserved] = await Promise.all([
+    readTypedHttpResponse(first),
+    readTypedHttpResponse(second),
+  ]);
+
+  // A bogus signature can only prove rejection. A genuine first acceptance
+  // followed by IDENTITY_HOST_ATTESTATION_REPLAY remains PARTIAL until Stage B
+  // ratifies and injects a mock verifier; this test never derives an HMAC from
+  // the unrelated broker shared secret.
+  expect({
+    first: { status: firstObserved.status, code: firstObserved.code },
+    second: { status: secondObserved.status, code: secondObserved.code },
+    peerCountDelta: (tableRowCount("peers") ?? 0) - (beforePeerCount ?? 0),
+  }).toEqual({
+    first: { status: 401, code: "IDENTITY_HOST_ATTESTATION_INVALID" },
+    second: { status: 401, code: "IDENTITY_HOST_ATTESTATION_INVALID" },
+    peerCountDelta: 0,
+  });
+});
+
+test("broker-client rejects host-attestation requests outside timestamp skew window", async () => {
+  const oldTs = String(Math.floor((Date.now() - 60 * 60 * 1000) / 1000));
+  const beforePeerCount = tableRowCount("peers");
+  const res = await postRegisterWithAttestation({
+    namespace: "tenant-a",
+    attestation: "bogus",
+    nonce: `skew-${Math.random().toString(36).slice(2)}`,
+    timestamp: oldTs,
+  });
+  const observed = await readTypedHttpResponse(res);
+  expect({
+    status: observed.status,
+    code: observed.code,
+    peerCountDelta: (tableRowCount("peers") ?? 0) - (beforePeerCount ?? 0),
+  }).toEqual({
+    status: 401,
+    code: "IDENTITY_HOST_ATTESTATION_TIME_SKEW",
+    peerCountDelta: 0,
+  });
+});
+
+test("release-seat requires explicit lease auth, not default session auth", async () => {
+  const reg = await createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret).register({
+    peer_type: "claude",
+    pid: 90,
+    cwd: "/release-seat",
+    git_root: null,
+    tty: null,
+    summary: "",
+    name: "release-seat-holder",
+  });
+
+  const payload = { id: reg.id, session_token: reg.session_token };
+  const res = await fetch(`http://127.0.0.1:${TEST_PORT}/release-seat`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      [SECRET_HEADER]: testSecret,
+    },
+    body: JSON.stringify(payload),
+  });
+  const observed = await readTypedHttpResponse(res);
+  expect({ status: observed.status, code: observed.code }).toEqual({
+    status: 401,
+    code: "IDENTITY_CREDENTIAL_REQUIRED",
+  });
+});
+
+test("fresh enrollment stores only salted verifier material, never plaintext reclaim credential", async () => {
+  const client = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
+  const reg = await client.register({
+    peer_type: "codex",
+    pid: 93,
+    cwd: "/credential-storage",
+    git_root: null,
+    tty: null,
+    summary: "",
+    name: "credential-storage",
+  });
+
+  const columns = handle.db.query<{ name: string }, []>(
+    "SELECT name FROM pragma_table_info('peers')"
+  ).all().map((row) => row.name);
+  expect(columns).toContain("credential_salt");
+  expect(columns).toContain("credential_verifier");
+  expect(columns).not.toContain("reclaim_credential");
+
+  const stored = handle.db.query<{
+    credential_salt: string | null;
+    credential_verifier: string | null;
+  }, [string]>(
+    "SELECT credential_salt, credential_verifier FROM peers WHERE id = ?"
+  ).get(reg.id);
+  expect(stored?.credential_salt).toBeTruthy();
+  expect(stored?.credential_verifier).toBeTruthy();
+  expect(JSON.stringify(stored)).not.toContain(reg.session_token);
+});
+
+test("C10 RED: proven pre-connect ECONNREFUSED queues locally but is never reported accepted", async () => {
+  const preConnect = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1"), {
+    code: "ECONNREFUSED",
+    syscall: "connect",
+  });
+  expect(isPreCommitBrokerUnavailable(preConnect)).toBe(true);
+
+  let fetchAttempts = 0;
+  const sendClient = createClient("http://127.0.0.1:1", testSecret, {
+    sendRetry: { attempts: 1, delaysMs: [0], requestTimeoutMs: 20 },
+    fetchImpl: async () => {
+      fetchAttempts += 1;
+      throw preConnect;
+    },
+  });
+  const outcome = await captureOutcome(() => sendClient.sendMessage({
+    from_id: "pre-connect-sender",
+    session_token: "pre-connect-session",
+    to_id_or_name: "pre-connect-target",
+    text: "must be queued without acceptance",
+  }));
+  const normalized = outcome.kind === "result"
+    ? {
+        kind: outcome.kind,
+        queued: (outcome.value as unknown as { queued?: unknown }).queued ?? null,
+        accepted: (outcome.value as unknown as { accepted?: unknown }).accepted ?? null,
+        code: (outcome.value as unknown as { code?: unknown }).code ?? null,
+      }
+    : {
+        kind: outcome.kind,
+        queued: null,
+        accepted: null,
+        code: (outcome.error as { code?: unknown } | null)?.code ?? null,
+      };
+
+  expect(fetchAttempts).toBe(1);
+  expect(normalized).toEqual({
+    kind: "result",
+    queued: true,
+    accepted: false,
+    code: "BROKER_UNAVAILABLE_QUEUED_NOT_ACCEPTED",
+  });
+});
+
+test.todo(
+  "PARTIAL C10: owner-local queue artifact creation awaits the Stage-B local-outbox seam",
+  () => {}
+);
+
+test("ambiguous post-connect send failure is never queued or retried", async () => {
+  const bootstrap = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
+  const sender = await bootstrap.register({
+    peer_type: "claude",
+    pid: 91,
+    cwd: "/send-queue",
+    git_root: null,
+    tty: null,
+    summary: "",
+    name: "queue-sender",
+  });
+  await bootstrap.register({
+    peer_type: "codex",
+    pid: 92,
+    cwd: "/send-queue",
+    git_root: null,
+    tty: null,
+    summary: "",
+    name: "queue-target",
+  });
+
+  let fetchAttempts = 0;
+  const sendClient = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret, {
+    sendRetry: { attempts: 4, delaysMs: [1], requestTimeoutMs: 20 },
+    fetchImpl: async () => {
+      fetchAttempts += 1;
+      const e = new Error("ambiguous broker send path") as Error & { code: string };
+      e.code = "ECONNRESET";
+      throw e;
+    },
+  });
+
+  const outcome = await captureOutcome(() => sendClient.sendMessage({
+    from_id: sender.id,
+    session_token: sender.session_token,
+    to_id_or_name: "queue-target",
+    text: "ambiguous path should not queue",
+  }));
+  expect(fetchAttempts).toBe(1);
+  expect(outcome.kind).toBe("error");
+  const error = outcome.kind === "error" ? outcome.error : null;
+  expect(error).toBeInstanceOf(Error);
+  expect((error as { queued?: unknown } | null)?.queued).not.toBe(true);
+  expect((error as Error | null)?.message).toMatch(/delivery uncertain/i);
+});
+
+test("C10 RED: ambiguous post-connect send failure exposes the exact typed not-queued code", async () => {
+  const sendClient = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret, {
+    sendRetry: { attempts: 4, delaysMs: [1], requestTimeoutMs: 20 },
+    fetchImpl: async () => {
+      throw Object.assign(new Error("ambiguous broker send path"), {
+        code: "ECONNRESET",
+      });
+    },
+  });
+  const outcome = await captureOutcome(() => sendClient.sendMessage({
+    from_id: "ambiguous-sender",
+    session_token: "ambiguous-session",
+    to_id_or_name: "ambiguous-target",
+    text: "typed ambiguous failure",
+  }));
+  expect(outcome.kind).toBe("error");
+  const error = outcome.kind === "error" ? outcome.error : null;
+  expect((error as { queued?: unknown } | null)?.queued).not.toBe(true);
+  expect((error as { code?: unknown } | null)?.code).toBe(
+    "BROKER_DELIVERY_UNCERTAIN_NOT_QUEUED"
+  );
+});
+
+test("C17 RED: /peer/queue rejects a stale identity snapshot without replay or DB mutation", async () => {
+  const client = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
+  const suffix = Math.random().toString(36).slice(2);
+  const sender = await client.register({
+    peer_type: "claude",
+    pid: 94,
+    cwd: "/queue-stale",
+    git_root: null,
+    tty: null,
+    summary: "",
+    name: `queue-stale-sender-${suffix}`,
+  });
+  const target = await client.register({
+    peer_type: "codex",
+    pid: 95,
+    cwd: "/queue-stale",
+    git_root: null,
+    tty: null,
+    summary: "",
+    name: `queue-stale-target-${suffix}`,
+  });
+  const before = brokerMutationSnapshot(sender.id);
+  const res = await postPeerQueue({
+    kind: "send_message",
+    queued_at_mono_ns: process.hrtime.bigint().toString(),
+    stable_identity_key: `stale-subject-${suffix}`,
+    identity_epoch: 0,
+    identity_state: "current",
+    host_namespace: "stale-host-namespace",
+    correlation: `queue-stale-${suffix}`,
+    request: {
+      from_id: sender.id,
+      to_id_or_name: target.name,
+      text: "stale queue entry must never replay",
+    },
+  });
+  const observed = await readTypedHttpResponse(res);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  expect(brokerMutationSnapshot(sender.id)).toEqual(before);
+  expect(res.ok).toBe(false);
+  expect(observed.code).toBe("IDENTITY_QUEUE_REPLAY_STALE");
+});
+
+test("C17 RED: /peer/queue rejects entries older than 900s without replay or DB mutation", async () => {
+  const client = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
+  const suffix = Math.random().toString(36).slice(2);
+  const sender = await client.register({
+    peer_type: "claude",
+    pid: 96,
+    cwd: "/queue-expired",
+    git_root: null,
+    tty: null,
+    summary: "",
+    name: `queue-expired-sender-${suffix}`,
+  });
+  const target = await client.register({
+    peer_type: "codex",
+    pid: 97,
+    cwd: "/queue-expired",
+    git_root: null,
+    tty: null,
+    summary: "",
+    name: `queue-expired-target-${suffix}`,
+  });
+  const before = brokerMutationSnapshot(sender.id);
+  const queuedAt = process.hrtime.bigint() - 901n * 1_000_000_000n;
+  const res = await postPeerQueue({
+    kind: "send_message",
+    queued_at_mono_ns: queuedAt.toString(),
+    stable_identity_key: sender.id,
+    identity_epoch: 0,
+    identity_state: "current",
+    host_namespace: "expired-host-namespace",
+    correlation: `queue-expired-${suffix}`,
+    request: {
+      from_id: sender.id,
+      to_id_or_name: target.name,
+      text: "expired queue entry must never replay",
+    },
+  });
+  const observed = await readTypedHttpResponse(res);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  expect(brokerMutationSnapshot(sender.id)).toEqual(before);
+  expect(res.ok).toBe(false);
+  expect(observed.code).toBe("IDENTITY_QUEUE_REPLAY_EXPIRED");
 });

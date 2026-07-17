@@ -60,6 +60,77 @@ function createLegacyDb(path: string) {
   db.close();
 }
 
+function createPreIdentityDb(path: string) {
+  const db = new Database(path);
+  db.exec("PRAGMA journal_mode = WAL;");
+  db.exec(`
+    CREATE TABLE peers (
+      id            TEXT PRIMARY KEY,
+      name          TEXT NOT NULL UNIQUE,
+      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex')),
+      host          TEXT,
+      pid           INTEGER,
+      cwd           TEXT,
+      git_root      TEXT,
+      tty           TEXT,
+      summary       TEXT DEFAULT '',
+      session_token TEXT NOT NULL,
+      registered_at TEXT NOT NULL,
+      last_seen     TEXT NOT NULL
+    );
+  `);
+  db.exec(`
+    CREATE TABLE messages (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_id           TEXT NOT NULL,
+      to_id             TEXT NOT NULL,
+      text              TEXT NOT NULL,
+      sent_at           TEXT NOT NULL,
+      acked             INTEGER NOT NULL DEFAULT 0,
+      lease_token       TEXT,
+      lease_expires_at  TEXT
+    );
+  `);
+  const ts = new Date().toISOString();
+  db.query(
+    `INSERT INTO peers
+       (id, name, peer_type, host, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    "pre-identity-peer",
+    "pre-identity",
+    "claude",
+    "legacy-reported-host",
+    9,
+    "/pre-identity",
+    null,
+    null,
+    "legacy summary",
+    "pre-identity-session-token",
+    ts,
+    ts
+  );
+  db.query(
+    `INSERT INTO messages (from_id, to_id, text, sent_at)
+     VALUES (?, ?, ?, ?)`
+  ).run(
+    "pre-identity-peer",
+    "missing-recipient",
+    "pre-identity provenance must remain unknown",
+    ts
+  );
+  db.close();
+}
+
+function schemaSignature(db: Database) {
+  return db.query<{ type: string; name: string; table_name: string; sql: string | null }, []>(
+    `SELECT type, name, tbl_name AS table_name, sql
+       FROM sqlite_master
+      WHERE name NOT LIKE 'sqlite_%'
+      ORDER BY type, name`
+  ).all();
+}
+
 test("initDb migrates pre-session_token DB: adds column, DROPS legacy peers, messages table intact", () => {
   TEST_DB = `/tmp/agent-peers-migration-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
   createLegacyDb(TEST_DB);
@@ -272,6 +343,172 @@ test("initDb self-heals NULL session_token rows from a crashed partial migration
       "SELECT session_token FROM peers WHERE id = 'half-migrated-1'"
     ).get();
     expect(row?.session_token).toMatch(/^[a-f0-9-]{36}$/);
+  } finally {
+    db.close();
+  }
+});
+
+test("C9 RED: initDb adds identity transitions and nullable provenance without backfill, idempotent across reopen", () => {
+  TEST_DB = `/tmp/agent-peers-migration-identity-columns-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+  createPreIdentityDb(TEST_DB);
+
+  const first = initDb(TEST_DB);
+  const firstSchema = schemaSignature(first);
+  first.close();
+
+  const db = initDb(TEST_DB);
+  try {
+    expect(schemaSignature(db)).toEqual(firstSchema);
+
+    const peerCols = db.query<{ name: string }, []>(
+      "SELECT name FROM pragma_table_info('peers')"
+    ).all().map((r) => r.name);
+    const msgCols = db.query<{ name: string }, []>(
+      "SELECT name FROM pragma_table_info('messages')"
+    ).all().map((r) => r.name);
+
+    const requiredPeerColumns = [
+      "stable_identity_key",
+      "authenticated_host_namespace",
+      "host_auth_method",
+      "identity_epoch",
+      "identity_state",
+      "credential_salt",
+      "credential_verifier",
+      "lease_owner_token_hash",
+      "lease_generation",
+      "broker_epoch",
+      "lease_owner_connection_id",
+      "lease_last_seen_mono_ns",
+      "lease_expires_mono_ns",
+      "lease_consecutive_misses",
+      "last_auth_method",
+      "sender_registry_state",
+    ];
+    const requiredMessageColumns = [
+      "provenance_version",
+      "sender_epoch_at_send",
+      "sender_stable_identity_key_at_send",
+      "sender_authenticated_host_namespace_at_send",
+      "sender_name_at_send",
+      "sender_peer_type_at_send",
+      "sender_cwd_at_send",
+      "sender_summary_at_send",
+    ];
+
+    for (const name of requiredPeerColumns) {
+      expect(peerCols).toContain(name);
+    }
+    for (const name of requiredMessageColumns) {
+      expect(msgCols).toContain(name);
+    }
+    expect(peerCols).not.toContain("reclaim_credential");
+
+    const tables = db.query<{ name: string }, []>(
+      "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).all().map(({ name }) => name);
+    expect(tables).toContain("identity_transitions");
+    const transitionCols = db.query<{ name: string }, []>(
+      "SELECT name FROM pragma_table_info('identity_transitions')"
+    ).all().map(({ name }) => name);
+    expect(transitionCols.length).toBeGreaterThan(0);
+    expect(transitionCols.some((name) =>
+      /token|secret|credential|verifier|salt/i.test(name)
+    )).toBe(false);
+
+    const row = db.query<{
+      stable_identity_key: string | null;
+      authenticated_host_namespace: string | null;
+      host_auth_method: string | null;
+      identity_epoch: number | null;
+      identity_state: string | null;
+      credential_salt: string | null;
+      credential_verifier: string | null;
+      broker_epoch: number | null;
+    }, [string]>(
+      `SELECT stable_identity_key, authenticated_host_namespace, host_auth_method, identity_epoch,
+              identity_state, credential_salt, credential_verifier, broker_epoch
+         FROM peers WHERE id = ?`
+    ).get("pre-identity-peer");
+    expect(row).toEqual({
+      stable_identity_key: null,
+      authenticated_host_namespace: null,
+      host_auth_method: null,
+      identity_epoch: null,
+      identity_state: null,
+      credential_salt: null,
+      credential_verifier: null,
+      broker_epoch: null,
+    });
+
+    const sampleMessageRow = db.query<{
+      provenance_version: string | null;
+      sender_epoch_at_send: number | null;
+      sender_stable_identity_key_at_send: string | null;
+      sender_authenticated_host_namespace_at_send: string | null;
+      sender_name_at_send: string | null;
+      sender_peer_type_at_send: string | null;
+      sender_cwd_at_send: string | null;
+      sender_summary_at_send: string | null;
+    }, []>(
+      `SELECT provenance_version, sender_epoch_at_send,
+              sender_stable_identity_key_at_send,
+              sender_authenticated_host_namespace_at_send,
+              sender_name_at_send, sender_peer_type_at_send,
+              sender_cwd_at_send, sender_summary_at_send
+         FROM messages LIMIT 1`
+    ).get();
+    expect(sampleMessageRow).toEqual({
+      provenance_version: null,
+      sender_epoch_at_send: null,
+      sender_stable_identity_key_at_send: null,
+      sender_authenticated_host_namespace_at_send: null,
+      sender_name_at_send: null,
+      sender_peer_type_at_send: null,
+      sender_cwd_at_send: null,
+      sender_summary_at_send: null,
+    });
+    expect(db.query<{ count: number }, []>(
+      "SELECT COUNT(*) AS count FROM identity_transitions"
+    ).get()?.count).toBe(0);
+  } finally {
+    db.close();
+  }
+});
+
+test("C9 RED: initDb creates partial stable-subject uniqueness and nullable INTEGER broker epoch", () => {
+  TEST_DB = `/tmp/agent-peers-migration-partial-idx-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+  createPreIdentityDb(TEST_DB);
+
+  const db = initDb(TEST_DB);
+  try {
+    const indexRows = db.query<{
+      name: string;
+      is_unique: number;
+      is_partial: number;
+      sql: string | null;
+    }, []>(
+      `SELECT il.name, il."unique" AS is_unique, il.partial AS is_partial, sm.sql
+         FROM pragma_index_list('peers') AS il
+         LEFT JOIN sqlite_master AS sm
+           ON sm.type = 'index' AND sm.name = il.name`
+    ).all();
+    const identityIndex = indexRows.find(({ is_unique, is_partial, sql }) => {
+      const normalized = (sql ?? "").toLowerCase();
+      return is_unique === 1
+        && is_partial === 1
+        && normalized.includes("stable_identity_key")
+        && normalized.includes("identity_state")
+        && normalized.includes("where");
+    });
+    expect(identityIndex).toBeDefined();
+
+    const brokerEpoch = db.query<{ type: string; not_null: number }, []>(
+      `SELECT type, "notnull" AS not_null
+         FROM pragma_table_info('peers')
+        WHERE name = 'broker_epoch'`
+    ).get();
+    expect(brokerEpoch).toEqual({ type: "INTEGER", not_null: 0 });
   } finally {
     db.close();
   }
