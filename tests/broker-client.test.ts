@@ -5,7 +5,6 @@ import { startBroker } from "../broker.ts";
 import {
   BrokerHttpError,
   createClient,
-  isSessionExpiredError,
 } from "../shared/broker-client.ts";
 import { chmodSync, readFileSync, unlinkSync, existsSync, writeFileSync } from "node:fs";
 
@@ -66,7 +65,7 @@ test("broker-client end-to-end: register → send → poll → ack", async () =>
   expect(acked.acked).toBe(1);
 });
 
-test("same-TTY collision expires the old holder and preserves the new holder", async () => {
+test("same-TTY collision returns 409 and preserves the live holder", async () => {
   const client = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
   const recipient = await client.register({
     peer_type: "claude", host: "lpreet-pco", pid: 40, cwd: "/collision-recipient",
@@ -76,90 +75,75 @@ test("same-TTY collision expires the old holder and preserves the new holder", a
     peer_type: "codex", host: "lpreet-pco", pid: 41, cwd: "/collision",
     git_root: null, tty: "/dev/pts/p0-collision", summary: "", name: "collision-holder",
   });
-  const newHolder = await client.register({
-    peer_type: "codex", host: "lpreet-pco", pid: 42, cwd: "/collision",
-    git_root: null, tty: "/dev/pts/p0-collision", summary: "replacement",
-    name: "ignored-on-physical-session-replacement",
+  let collisionError: unknown;
+  let collisionRejected = false;
+  try {
+    await client.register({
+      peer_type: "codex", host: " lpreet-pco ", pid: 42, cwd: "/collision",
+      git_root: null, tty: "/dev/pts/p0-collision", summary: "replacement-attempt",
+      name: "metadata-is-not-replacement-authority",
+    });
+  } catch (error) {
+    collisionRejected = true;
+    collisionError = error;
+  }
+
+  // The HTTP contract is a generic 409. BrokerHttpError deliberately drains
+  // the response body and retains only path/status, so no credential or row
+  // metadata can escape through the client exception.
+  expect(collisionRejected).toBe(true);
+  expect(collisionError).toBeInstanceOf(BrokerHttpError);
+  expect((collisionError as BrokerHttpError).path).toBe("/register");
+  expect((collisionError as BrokerHttpError).status).toBe(409);
+  expect((collisionError as Error).message.includes(oldHolder.session_token)).toBe(false);
+  expect((collisionError as Error).message.includes("replacement-attempt")).toBe(false);
+
+  await client.heartbeat({ id: oldHolder.id, session_token: oldHolder.session_token });
+  await client.setSummary({
+    id: oldHolder.id, session_token: oldHolder.session_token, summary: "original holder active",
   });
+  expect(await client.pollMessages({
+    id: oldHolder.id, session_token: oldHolder.session_token,
+  })).toHaveLength(0);
 
-  expect(newHolder.id).toBe(oldHolder.id);
-  expect(newHolder.name).toBe(oldHolder.name);
-  expect(newHolder.session_token).not.toBe(oldHolder.session_token);
-
-  const expectExpired = async (promise: Promise<unknown>, path: string) => {
-    try {
-      await promise;
-      throw new Error(`expected ${path} to reject`);
-    } catch (error) {
-      expect(error).toBeInstanceOf(BrokerHttpError);
-      expect(isSessionExpiredError(error)).toBe(true);
-      expect((error as BrokerHttpError).path).toBe(path);
-      expect((error as Error).message).not.toContain(oldHolder.session_token);
-    }
-  };
-
-  await expectExpired(
-    client.pollMessages({ id: oldHolder.id, session_token: oldHolder.session_token }),
-    "/poll-messages",
-  );
-  await expectExpired(
-    client.heartbeat({ id: oldHolder.id, session_token: oldHolder.session_token }),
-    "/heartbeat",
-  );
-  await expectExpired(
-    client.setSummary({ id: oldHolder.id, session_token: oldHolder.session_token, summary: "stale" }),
-    "/set-summary",
-  );
-  await expectExpired(
-    client.unregister({ id: oldHolder.id, session_token: oldHolder.session_token }),
-    "/unregister",
-  );
-
-  const staleSend = await client.sendMessage({
+  const holderSend = await client.sendMessage({
     from_id: oldHolder.id,
     session_token: oldHolder.session_token,
     to_id_or_name: recipient.id,
-    text: "must not land",
+    text: "original holder outbound",
   });
-  expect(staleSend.ok).toBe(false);
-  expect(staleSend.error).toMatch(/^unauthorized sender:/);
-  expect(staleSend.error).not.toContain(oldHolder.session_token);
-  expect(staleSend.error).not.toContain("must not land");
+  expect(holderSend.ok).toBe(true);
 
   const machinePeers = await client.listPeers({
     scope: "machine", cwd: "/any", git_root: null, peer_type: "codex",
   });
-  const collisionProjection = machinePeers.find((peer) => peer.id === newHolder.id);
+  const collisionProjection = machinePeers.find((peer) => peer.id === oldHolder.id);
   expect(collisionProjection).toBeDefined();
-  expect(collisionProjection?.id).toBe(newHolder.id);
+  expect(collisionProjection?.id).toBe(oldHolder.id);
   expect(collisionProjection?.name).toBe(oldHolder.name);
-  expect(machinePeers.filter((peer) => peer.id === newHolder.id)).toHaveLength(1);
+  expect(collisionProjection?.pid).toBe(41);
+  expect(collisionProjection?.summary).toBe("original holder active");
+  expect(machinePeers.filter((peer) => peer.id === oldHolder.id)).toHaveLength(1);
   expect(Object.prototype.hasOwnProperty.call(collisionProjection!, "session_token")).toBe(false);
   expect(Object.prototype.hasOwnProperty.call(collisionProjection!, "reclaim_token")).toBe(false);
-
-  await client.heartbeat({ id: newHolder.id, session_token: newHolder.session_token });
-  await client.setSummary({
-    id: newHolder.id, session_token: newHolder.session_token, summary: "new holder active",
-  });
-  const outbound = await client.sendMessage({
-    from_id: newHolder.id,
-    session_token: newHolder.session_token,
-    to_id_or_name: recipient.id,
-    text: "new holder outbound",
-  });
-  expect(outbound.ok).toBe(true);
 
   const inbound = await client.sendMessage({
     from_id: recipient.id,
     session_token: recipient.session_token,
-    to_id_or_name: newHolder.id,
-    text: "new holder inbox",
+    to_id_or_name: oldHolder.id,
+    text: "original holder inbox",
   });
   expect(inbound.ok).toBe(true);
-  const newInbox = await client.pollMessages({
-    id: newHolder.id, session_token: newHolder.session_token,
+  const holderInbox = await client.pollMessages({
+    id: oldHolder.id, session_token: oldHolder.session_token,
   });
-  expect(newInbox.map((message) => message.text)).toContain("new holder inbox");
+  expect(holderInbox.map((message) => message.text)).toContain("original holder inbox");
+  expect((await client.ackMessages({
+    id: oldHolder.id,
+    session_token: oldHolder.session_token,
+    lease_tokens: holderInbox.map((message) => message.lease_token),
+  })).acked).toBe(holderInbox.length);
+  await client.unregister({ id: oldHolder.id, session_token: oldHolder.session_token });
 });
 
 test("broker-client polls and acks host intents via shared-secret endpoints", async () => {

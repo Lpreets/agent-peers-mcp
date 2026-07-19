@@ -1,6 +1,7 @@
 // Comprehensive unit tests for broker.ts — covers every in-process primitive.
 
-import { test, expect, beforeEach, afterEach } from "bun:test";
+import { test, expect, beforeEach, afterEach, setSystemTime } from "bun:test";
+import * as brokerModule from "../broker.ts";
 import {
   initDb,
   registerPeer,
@@ -33,8 +34,12 @@ afterEach(() => {
   if (existsSync(TEST_DB)) unlinkSync(TEST_DB);
 });
 
-// Helper: register and return a full auth handle.
-function reg(opts: {
+type ReplacementProof = {
+  peer_id: string;
+  capability: string;
+};
+
+type RegistrationOptions = {
   name?: string;
   peer_type?: "claude" | "codex";
   host?: string | null;
@@ -43,8 +48,52 @@ function reg(opts: {
   tty?: string | null;
   summary?: string;
   pid?: number;
-}) {
-  return registerPeer(db, {
+  replacement?: ReplacementProof;
+};
+
+type RegistrationRequestWithReplacement = Parameters<typeof registerPeer>[1] & {
+  replacement?: ReplacementProof;
+};
+
+type RegistrationResult = ReturnType<typeof registerPeer>;
+
+type RegistrationAttempt = {
+  result?: RegistrationResult;
+  error?: unknown;
+};
+
+type ReplacementCapability = {
+  capability: string;
+  expires_at: string;
+};
+
+type ReplacementIssuer = (
+  targetDb: Database,
+  peerId: string,
+  sessionToken: string,
+) => ReplacementCapability;
+
+type LiveHolderConflictConstructor = abstract new (...args: never[]) => Error;
+
+type HolderSnapshot = {
+  id: string;
+  name: string;
+  peer_type: string;
+  host: string | null;
+  pid: number;
+  cwd: string;
+  git_root: string | null;
+  tty: string | null;
+  summary: string;
+  session_token: string;
+  registered_at: string;
+  last_seen: string;
+};
+
+// Helper: register and return a full auth handle. The intersection keeps this
+// test compile-safe before the future replacement field lands in shared types.
+function reg(opts: RegistrationOptions) {
+  const request = {
     peer_type: opts.peer_type ?? "claude",
     pid: opts.pid ?? 1,
     cwd: opts.cwd ?? "/x",
@@ -53,7 +102,96 @@ function reg(opts: {
     host: opts.host,
     summary: opts.summary ?? "",
     ...(opts.name ? { name: opts.name } : {}),
+  } as RegistrationRequestWithReplacement;
+  if (opts.replacement) request.replacement = opts.replacement;
+  return registerPeer(db, request);
+}
+
+function attemptRegistration(opts: RegistrationOptions): RegistrationAttempt {
+  try {
+    return { result: reg(opts) };
+  } catch (error) {
+    return { error };
+  }
+}
+
+function issueReplacementCapability(
+  peerId: string,
+  sessionToken: string,
+): ReplacementCapability {
+  const issuer = (brokerModule as unknown as {
+    issueReplacementCapability?: ReplacementIssuer;
+  }).issueReplacementCapability;
+  if (typeof issuer !== "function") {
+    throw new Error("RED contract missing: issueReplacementCapability");
+  }
+  const grant = issuer(db, peerId, sessionToken);
+  expect(typeof grant.capability).toBe("string");
+  expect(grant.capability.length >= 22).toBe(true); // >=128 bits in base64url form
+  expect(Number.isFinite(Date.parse(grant.expires_at))).toBe(true);
+  return grant;
+}
+
+function expectLiveHolderConflict(
+  attempt: RegistrationAttempt,
+  forbiddenValues: string[] = [],
+): void {
+  // Assert presence as booleans so a failing RED run cannot print a returned
+  // RegisterResponse (which contains the disposable session token).
+  expect(attempt.result === undefined).toBe(true);
+  expect(attempt.error instanceof Error).toBe(true);
+  if (!(attempt.error instanceof Error)) return;
+
+  const conflictConstructor = (brokerModule as unknown as {
+    LiveHolderConflictError?: LiveHolderConflictConstructor;
+  }).LiveHolderConflictError;
+  expect(typeof conflictConstructor).toBe("function");
+  if (typeof conflictConstructor === "function") {
+    expect(attempt.error instanceof conflictConstructor).toBe(true);
+  }
+  expect(attempt.error.name).toBe("LiveHolderConflictError");
+  expect((attempt.error as Error & { code?: string }).code).toBe("LIVE_HOLDER_CONFLICT");
+  for (const forbidden of forbiddenValues) {
+    expect(attempt.error.message.includes(forbidden)).toBe(false);
+  }
+}
+
+function snapshotHolder(peerId: string): HolderSnapshot {
+  return db.query<HolderSnapshot, [string]>(
+    `SELECT id, name, peer_type, host, pid, cwd, git_root, tty, summary,
+            session_token, registered_at, last_seen
+       FROM peers WHERE id = ?`,
+  ).get(peerId)!;
+}
+
+function expectHolderUnchanged(before: HolderSnapshot): void {
+  const after = snapshotHolder(before.id);
+  expect({
+    id: after.id,
+    name: after.name,
+    peer_type: after.peer_type,
+    host: after.host,
+    pid: after.pid,
+    cwd: after.cwd,
+    git_root: after.git_root,
+    tty: after.tty,
+    summary: after.summary,
+    registered_at: after.registered_at,
+    last_seen: after.last_seen,
+  }).toEqual({
+    id: before.id,
+    name: before.name,
+    peer_type: before.peer_type,
+    host: before.host,
+    pid: before.pid,
+    cwd: before.cwd,
+    git_root: before.git_root,
+    tty: before.tty,
+    summary: before.summary,
+    registered_at: before.registered_at,
+    last_seen: before.last_seen,
   });
+  expect(after.session_token === before.session_token).toBe(true);
 }
 
 // ---------- schema ----------
@@ -149,25 +287,45 @@ test("registerPeer does NOT reclaim a LIVE peer, falls through to suffix", () =>
   expect(second.name).toBe("active-2");
 });
 
-test("registerPeer replaces live peer in same tty cwd and type, preserving id and name", () => {
-  const first = reg({ peer_type: "codex", cwd: "/repo", tty: "pts/9", pid: 101 });
-  const second = reg({ peer_type: "codex", cwd: "/repo", tty: "pts/9", pid: 202 });
+test("registerPeer refuses an active same-tuple collision without mutating its holder", () => {
+  const first = reg({
+    name: "live-holder",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/repo",
+    tty: "pts/9",
+    pid: 101,
+    summary: "holder summary",
+  });
+  const before = snapshotHolder(first.id);
+  const attempt = attemptRegistration({
+    name: "spoofed-replacement-name",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/repo",
+    tty: "pts/9",
+    pid: 202,
+    summary: "spoofed replacement summary",
+  });
 
-  expect(second.id).toBe(first.id);
-  expect(second.name).toBe(first.name);
-  expect(second.session_token).not.toBe(first.session_token);
+  expectLiveHolderConflict(attempt, [
+    first.id,
+    first.name,
+    first.session_token,
+    "lpreet-pco",
+    "/repo",
+    "pts/9",
+    "holder summary",
+    "spoofed-replacement-name",
+    "spoofed replacement summary",
+  ]);
+  expectHolderUnchanged(before);
   expect(listPeers(db, { scope: "machine", cwd: "/any", git_root: null, peer_type: "codex" })).toHaveLength(1);
-
-  const row = db.query<{ pid: number; cwd: string; tty: string; peer_type: string }, [string]>(
-    "SELECT pid, cwd, tty, peer_type FROM peers WHERE id = ?"
-  ).get(second.id)!;
-  expect(row).toEqual({ pid: 202, cwd: "/repo", tty: "pts/9", peer_type: "codex" });
-
-  expect(() => heartbeatPeer(db, first.id, first.session_token)).toThrow(SessionExpiredError);
-  expect(getPeer(db, second.id)?.pid).toBe(202);
+  expect(() => heartbeatPeer(db, first.id, first.session_token)).not.toThrow();
+  expect(getPeer(db, first.id)?.pid).toBe(101);
 });
 
-test("registerPeer same tty cwd and type clears stale leases for replaced row", () => {
+test("denied active collision preserves the holder's lease and mailbox authority", () => {
   const sender = reg({ name: "sender" });
   const first = reg({ name: "receiver", peer_type: "codex", cwd: "/repo", tty: "pts/9" });
 
@@ -177,23 +335,72 @@ test("registerPeer same tty cwd and type clears stale leases for replaced row", 
   });
   const leased = pollMessages(db, first.id, first.session_token);
   expect(leased).toHaveLength(1);
+  const beforeHolder = snapshotHolder(first.id);
+  const beforeLease = db.query<{
+    lease_token: string | null;
+    lease_expires_at: string | null;
+    acked: number;
+  }, [number]>(
+    "SELECT lease_token, lease_expires_at, acked FROM messages WHERE id = ?",
+  ).get(leased[0]!.id)!;
 
-  const second = reg({ name: "new-name", peer_type: "codex", cwd: "/repo", tty: "pts/9", pid: 303 });
-  expect(second.id).toBe(first.id);
-  expect(second.name).toBe("receiver");
+  const attempt = attemptRegistration({
+    name: "new-name",
+    peer_type: "codex",
+    cwd: "/repo",
+    tty: "pts/9",
+    pid: 303,
+  });
+  expectLiveHolderConflict(attempt, [first.session_token]);
+  expectHolderUnchanged(beforeHolder);
 
-  const backlog = pollMessages(db, second.id, second.session_token);
-  expect(backlog.map((m) => m.text)).toEqual(["leased"]);
+  const afterLease = db.query<{
+    lease_token: string | null;
+    lease_expires_at: string | null;
+    acked: number;
+  }, [number]>(
+    "SELECT lease_token, lease_expires_at, acked FROM messages WHERE id = ?",
+  ).get(leased[0]!.id)!;
+  expect(afterLease.lease_token === beforeLease.lease_token).toBe(true);
+  expect(afterLease.lease_expires_at).toBe(beforeLease.lease_expires_at);
+  expect(afterLease.acked).toBe(beforeLease.acked);
+
+  const stillLeased = pollMessages(db, first.id, first.session_token);
+  expect(stillLeased).toHaveLength(1);
+  expect(stillLeased[0]!.id).toBe(leased[0]!.id);
+  expect(stillLeased[0]!.lease_token === leased[0]!.lease_token).toBe(false);
+  expect(ackMessages(db, {
+    id: first.id,
+    session_token: first.session_token,
+    lease_tokens: [stillLeased[0]!.lease_token],
+  }).acked).toBe(1);
 });
 
-test("registerPeer same tty cwd and type replaces named live peer instead of suffixing", () => {
-  const first = reg({ name: "stable", peer_type: "codex", cwd: "/repo", tty: "pts/9", pid: 101 });
-  const second = reg({ name: "stable", peer_type: "codex", cwd: "/repo", tty: "pts/9", pid: 202 });
+test("exact metadata and matching name do not authorize active replacement", () => {
+  const first = reg({
+    name: "stable",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/repo",
+    tty: "pts/9",
+    pid: 101,
+    summary: "identical metadata",
+  });
+  const before = snapshotHolder(first.id);
+  const attempt = attemptRegistration({
+    name: "stable",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/repo",
+    tty: "pts/9",
+    pid: 101,
+    summary: "identical metadata",
+  });
 
-  expect(second.id).toBe(first.id);
-  expect(second.name).toBe("stable");
-  expect(second.session_token).not.toBe(first.session_token);
+  expectLiveHolderConflict(attempt, [first.session_token, "identical metadata"]);
+  expectHolderUnchanged(before);
   expect(getPeerByName(db, "stable-2")).toBeNull();
+  expect(() => heartbeatPeer(db, first.id, first.session_token)).not.toThrow();
 });
 
 test("registerPeer keeps distinct peers for different tty cwd or empty tty", () => {
@@ -228,24 +435,41 @@ test("registerPeer keeps same cwd tty type distinct across different hosts", () 
   expect(peers.map((p) => p.host).sort()).toEqual(["lpreet-pc", "lpreet-pco"]);
 });
 
-test("registerPeer replaces same host cwd tty type and normalizes host", () => {
+test("registerPeer normalizes host for comparison but refuses an active match", () => {
   const first = reg({ name: "stable-host", peer_type: "codex", host: "Lpreet-PCO", cwd: "/repo", tty: "pts/9", pid: 101 });
-  const second = reg({ name: "stable-host", peer_type: "codex", host: " lpreet-pco ", cwd: "/repo", tty: "pts/9", pid: 202 });
+  const before = snapshotHolder(first.id);
+  const attempt = attemptRegistration({
+    name: "stable-host",
+    peer_type: "codex",
+    host: " lpreet-pco ",
+    cwd: "/repo",
+    tty: "pts/9",
+    pid: 202,
+  });
 
-  expect(second.id).toBe(first.id);
-  expect(second.name).toBe("stable-host");
-  expect(second.session_token).not.toBe(first.session_token);
-  const row = getPeer(db, second.id)!;
+  expectLiveHolderConflict(attempt, [first.session_token]);
+  expectHolderUnchanged(before);
+  const row = getPeer(db, first.id)!;
   expect(row.host).toBe("lpreet-pco");
-  expect(row.pid).toBe(202);
+  expect(row.pid).toBe(101);
 });
 
-test("registerPeer legacy null host dedupes as today", () => {
+test("registerPeer refuses an active legacy null-host match", () => {
   const first = reg({ name: "legacy-hostless", peer_type: "codex", host: null, cwd: "/repo", tty: "pts/9", pid: 101 });
-  const second = reg({ name: "legacy-hostless", peer_type: "codex", host: null, cwd: "/repo", tty: "pts/9", pid: 202 });
+  const before = snapshotHolder(first.id);
+  const attempt = attemptRegistration({
+    name: "legacy-hostless",
+    peer_type: "codex",
+    host: null,
+    cwd: "/repo",
+    tty: "pts/9",
+    pid: 202,
+  });
 
-  expect(second.id).toBe(first.id);
-  expect(getPeer(db, second.id)?.host).toBeNull();
+  expectLiveHolderConflict(attempt, [first.session_token]);
+  expectHolderUnchanged(before);
+  expect(getPeer(db, first.id)?.host).toBeNull();
+  expect(getPeer(db, first.id)?.pid).toBe(101);
 });
 
 test("registerPeer null host and populated host are distinct during transition", () => {
@@ -258,6 +482,279 @@ test("registerPeer null host and populated host are distinct during transition",
     .run("2000-01-01T00:00:00.000Z", legacy.id);
   expect(gcStalePeers(db)).toBe(1);
   expect(listPeers(db, { scope: "machine", cwd: "/any", git_root: null, peer_type: "codex" })).toHaveLength(1);
+});
+
+test("replacement capability issuance requires the current holder token", () => {
+  const holder = reg({
+    name: "grant-auth-holder",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/grant-auth",
+    tty: "pts/31",
+  });
+  const before = snapshotHolder(holder.id);
+
+  expect(() => issueReplacementCapability(holder.id, "wrong-token"))
+    .toThrow(SessionExpiredError);
+  expectHolderUnchanged(before);
+  expect(() => heartbeatPeer(db, holder.id, holder.session_token)).not.toThrow();
+});
+
+test("valid replacement capability succeeds once and preserves mailbox continuity", () => {
+  const sender = reg({ name: "grant-sender" });
+  const holder = reg({
+    name: "grant-holder",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/grant",
+    tty: "pts/32",
+    pid: 101,
+  });
+
+  expect(sendMessage(db, {
+    from_id: sender.id,
+    session_token: sender.session_token,
+    to_id_or_name: holder.id,
+    text: "already acked",
+  }).ok).toBe(true);
+  const acknowledged = pollMessages(db, holder.id, holder.session_token);
+  expect(ackMessages(db, {
+    id: holder.id,
+    session_token: holder.session_token,
+    lease_tokens: [acknowledged[0]!.lease_token],
+  }).acked).toBe(1);
+
+  expect(sendMessage(db, {
+    from_id: sender.id,
+    session_token: sender.session_token,
+    to_id_or_name: holder.id,
+    text: "leased before replacement",
+  }).ok).toBe(true);
+  expect(pollMessages(db, holder.id, holder.session_token)).toHaveLength(1);
+  expect(sendMessage(db, {
+    from_id: sender.id,
+    session_token: sender.session_token,
+    to_id_or_name: holder.id,
+    text: "unleased before replacement",
+  }).ok).toBe(true);
+
+  const grant = issueReplacementCapability(holder.id, holder.session_token);
+  const replacement = reg({
+    name: "metadata-name-is-ignored",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/grant",
+    tty: "pts/32",
+    pid: 202,
+    replacement: { peer_id: holder.id, capability: grant.capability },
+  });
+  expect(replacement.id).toBe(holder.id);
+  expect(replacement.name).toBe(holder.name);
+  expect(replacement.session_token === holder.session_token).toBe(false);
+  expect(() => heartbeatPeer(db, holder.id, holder.session_token)).toThrow(SessionExpiredError);
+  expect(() => heartbeatPeer(db, replacement.id, replacement.session_token)).not.toThrow();
+
+  const backlog = pollMessages(db, replacement.id, replacement.session_token);
+  expect(backlog.map((message) => message.text).sort()).toEqual([
+    "leased before replacement",
+    "unleased before replacement",
+  ]);
+  expect(backlog.some((message) => message.text === "already acked")).toBe(false);
+
+  const beforeReplay = snapshotHolder(replacement.id);
+  const replay = attemptRegistration({
+    name: "replay-attempt",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/grant",
+    tty: "pts/32",
+    pid: 303,
+    replacement: { peer_id: holder.id, capability: grant.capability },
+  });
+  expectLiveHolderConflict(replay, [replacement.session_token, grant.capability]);
+  expectHolderUnchanged(beforeReplay);
+});
+
+test("wrong capability conflicts without consuming a valid grant", () => {
+  const holder = reg({
+    name: "wrong-grant-holder",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/wrong-grant",
+    tty: "pts/33",
+    pid: 101,
+  });
+  const grant = issueReplacementCapability(holder.id, holder.session_token);
+  const before = snapshotHolder(holder.id);
+  const invalidCapability = "test-only-invalid-capability";
+  const denied = attemptRegistration({
+    name: "wrong-grant-attempt",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/wrong-grant",
+    tty: "pts/33",
+    pid: 202,
+    replacement: { peer_id: holder.id, capability: invalidCapability },
+  });
+  expectLiveHolderConflict(denied, [holder.session_token, invalidCapability]);
+  expectHolderUnchanged(before);
+
+  const replacement = reg({
+    name: "valid-after-wrong",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/wrong-grant",
+    tty: "pts/33",
+    pid: 303,
+    replacement: { peer_id: holder.id, capability: grant.capability },
+  });
+  expect(replacement.id).toBe(holder.id);
+  expect(replacement.session_token === holder.session_token).toBe(false);
+});
+
+test("replacement capability is bound to its issuing peer", () => {
+  const target = reg({
+    name: "bound-target",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/bound-target",
+    tty: "pts/34",
+    pid: 101,
+  });
+  const grantOwner = reg({
+    name: "bound-owner",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/bound-owner",
+    tty: "pts/35",
+    pid: 201,
+  });
+  const grant = issueReplacementCapability(grantOwner.id, grantOwner.session_token);
+  const targetBefore = snapshotHolder(target.id);
+  const ownerBefore = snapshotHolder(grantOwner.id);
+
+  const denied = attemptRegistration({
+    name: "cross-peer-attempt",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/bound-target",
+    tty: "pts/34",
+    pid: 102,
+    replacement: { peer_id: grantOwner.id, capability: grant.capability },
+  });
+  expectLiveHolderConflict(denied, [target.session_token, grant.capability]);
+  expectHolderUnchanged(targetBefore);
+  expectHolderUnchanged(ownerBefore);
+
+  const ownerReplacement = reg({
+    name: "bound-owner-replacement",
+    peer_type: "codex",
+    host: "lpreet-pco",
+    cwd: "/bound-owner",
+    tty: "pts/35",
+    pid: 202,
+    replacement: { peer_id: grantOwner.id, capability: grant.capability },
+  });
+  expect(ownerReplacement.id).toBe(grantOwner.id);
+  expect(ownerReplacement.session_token === grantOwner.session_token).toBe(false);
+});
+
+test("expired replacement capability conflicts without mutating the holder", () => {
+  const issuedAt = new Date("2040-01-02T03:04:05.000Z");
+  setSystemTime(issuedAt);
+  try {
+    const holder = reg({
+      name: "expired-grant-holder",
+      peer_type: "codex",
+      host: "lpreet-pco",
+      cwd: "/expired-grant",
+      tty: "pts/36",
+      pid: 101,
+    });
+    const grant = issueReplacementCapability(holder.id, holder.session_token);
+    expect(Date.parse(grant.expires_at) === issuedAt.getTime() + 30_000).toBe(true);
+    const before = snapshotHolder(holder.id);
+
+    setSystemTime(issuedAt.getTime() + 30_001);
+    const denied = attemptRegistration({
+      name: "expired-grant-attempt",
+      peer_type: "codex",
+      host: "lpreet-pco",
+      cwd: "/expired-grant",
+      tty: "pts/36",
+      pid: 202,
+      replacement: { peer_id: holder.id, capability: grant.capability },
+    });
+    expectLiveHolderConflict(denied, [holder.session_token, grant.capability]);
+    expectHolderUnchanged(before);
+  } finally {
+    setSystemTime();
+  }
+});
+
+test("same-tuple row exactly at the stale cutoff is still live and conflicts", () => {
+  const now = new Date("2040-02-03T04:05:06.000Z");
+  setSystemTime(now);
+  try {
+    const holder = reg({
+      name: "cutoff-live",
+      peer_type: "codex",
+      host: "lpreet-pco",
+      cwd: "/cutoff-live",
+      tty: "pts/37",
+      pid: 101,
+    });
+    db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
+      .run(new Date(now.getTime() - 60_000).toISOString(), holder.id);
+    const before = snapshotHolder(holder.id);
+
+    const denied = attemptRegistration({
+      name: "cutoff-live",
+      peer_type: "codex",
+      host: "lpreet-pco",
+      cwd: "/cutoff-live",
+      tty: "pts/37",
+      pid: 202,
+    });
+    expectLiveHolderConflict(denied, [holder.session_token]);
+    expectHolderUnchanged(before);
+    expect(() => heartbeatPeer(db, holder.id, holder.session_token)).not.toThrow();
+  } finally {
+    setSystemTime();
+  }
+});
+
+test("same-tuple row one millisecond before the cutoff is stale and reclaims", () => {
+  const now = new Date("2040-02-03T04:05:06.000Z");
+  setSystemTime(now);
+  try {
+    const stale = reg({
+      name: "cutoff-stale",
+      peer_type: "codex",
+      host: "lpreet-pco",
+      cwd: "/cutoff-stale",
+      tty: "pts/38",
+      pid: 101,
+    });
+    db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
+      .run(new Date(now.getTime() - 60_001).toISOString(), stale.id);
+
+    const reclaimed = reg({
+      name: "cutoff-stale",
+      peer_type: "codex",
+      host: "lpreet-pco",
+      cwd: "/cutoff-stale",
+      tty: "pts/38",
+      pid: 202,
+    });
+    expect(reclaimed.id).toBe(stale.id);
+    expect(reclaimed.name).toBe(stale.name);
+    expect(reclaimed.session_token === stale.session_token).toBe(false);
+    expect(() => heartbeatPeer(db, stale.id, stale.session_token)).toThrow(SessionExpiredError);
+    expect(() => heartbeatPeer(db, reclaimed.id, reclaimed.session_token)).not.toThrow();
+  } finally {
+    setSystemTime();
+  }
 });
 
 test("stale peers stay absent from machine/directory/repo and from unrelated re-registration", () => {
@@ -641,12 +1138,14 @@ test("sendMessage allows refresh guard precheck target to reply after same-tty t
   });
   expect(precheck.ok).toBe(true);
 
+  const replacementGrant = issueReplacementCapability(target.id, target.session_token);
   const replacement = reg({
     name: "target-codex",
     peer_type: "codex",
     cwd: "/repo",
     tty: "pts/9",
     pid: 202,
+    replacement: { peer_id: target.id, capability: replacementGrant.capability },
   });
   expect(replacement.id).toBe(target.id);
   expect(replacement.session_token).not.toBe(target.session_token);
@@ -693,12 +1192,14 @@ test("sendMessage refresh guard stale-token exception requires the precheck nonc
     text: "ADDR refresh-pair precheck test: reply ROTATION_OK ROTATION-good-nonce",
   }).ok).toBe(true);
 
+  const replacementGrant = issueReplacementCapability(target.id, target.session_token);
   const replacement = reg({
     name: "target-codex",
     peer_type: "codex",
     cwd: "/repo",
     tty: "pts/9",
     pid: 202,
+    replacement: { peer_id: target.id, capability: replacementGrant.capability },
   });
   expect(replacement.id).toBe(target.id);
   expect(replacement.session_token).not.toBe(target.session_token);

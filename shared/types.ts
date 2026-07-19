@@ -35,6 +35,11 @@ export interface LeasedMessage {
 
 // ----- Broker API request/response -----
 
+export interface ReplacementProof {
+  peer_id: PeerId;
+  capability: string;
+}
+
 export interface RegisterRequest {
   peer_type: PeerType;
   host?: string | null;
@@ -44,12 +49,23 @@ export interface RegisterRequest {
   git_root: string | null;
   tty: string | null;
   summary: string;
+  replacement?: ReplacementProof;
 }
 
 export interface RegisterResponse {
   id: PeerId;
   name: PeerName;
   session_token: string; // opaque per-session auth token; required on peer mutations
+}
+
+export interface PrepareReplacementRequest {
+  peer_id: PeerId;
+  session_token: string;
+}
+
+export interface PrepareReplacementResponse {
+  capability: string;
+  expires_at: string;
 }
 
 export interface HeartbeatRequest { id: PeerId; session_token: string; }

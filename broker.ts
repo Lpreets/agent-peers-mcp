@@ -6,7 +6,7 @@
 import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync, writeFileSync, chmodSync, openSync, closeSync, writeSync, fsyncSync, linkSync, unlinkSync, existsSync, renameSync, statSync } from "node:fs";
 import { validateSecretFilePerms } from "./shared/shared-secret.ts";
 import { isLoopbackHost, resolveBrokerBindConfig } from "./shared/broker-config.ts";
@@ -15,6 +15,7 @@ import type {
   ListPeersRequest, SendMessageRequest, SendMessageResponse,
   LeasedMessage, AckMessagesRequest, AckMessagesResponse,
   RenamePeerRequest, RenamePeerResponse,
+  PrepareReplacementRequest, PrepareReplacementResponse, ReplacementProof,
 } from "./shared/types.ts";
 import { generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
 import { startWakeWorker, type WakeWorker } from "./shared/wake-worker.ts";
@@ -34,6 +35,7 @@ export const STALE_THRESHOLD_MS = 60_000;
 export const STALE_RECLAIM_THRESHOLD_MS = 60_000;
 export const LEASE_DURATION_MS = 30_000;
 export const GC_INTERVAL_MS = 30_000;
+export const REPLACEMENT_CAPABILITY_TTL_MS = 30_000;
 export const SECRET_HEADER = "x-agent-peers-secret";
 
 export class SessionExpiredError extends Error {
@@ -41,6 +43,78 @@ export class SessionExpiredError extends Error {
     super("session expired or unknown peer");
     this.name = "SessionExpiredError";
   }
+}
+
+export class LiveHolderConflictError extends Error {
+  readonly code = "LIVE_HOLDER_CONFLICT";
+
+  constructor() {
+    super("live holder conflict");
+    this.name = "LiveHolderConflictError";
+  }
+}
+
+interface ReplacementCapabilityRecord {
+  peerId: string;
+  capabilityVerifier: Buffer;
+  holderSessionVerifier: Buffer;
+  expiresAtMs: number;
+}
+
+// Capabilities are deliberately process-local for this first implementation:
+// a broker restart invalidates every outstanding handoff. Store only SHA-256
+// verifiers, never the raw capability or session token.
+const replacementCapabilities = new Map<string, ReplacementCapabilityRecord>();
+
+function secretVerifier(secret: string): Buffer {
+  return createHash("sha256").update(secret, "utf8").digest();
+}
+
+function verifierMatches(left: Buffer, right: Buffer): boolean {
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function pruneExpiredReplacementCapabilities(now = Date.now()): void {
+  for (const [peerId, grant] of replacementCapabilities) {
+    if (grant.expiresAtMs <= now) replacementCapabilities.delete(peerId);
+  }
+}
+
+export function issueReplacementCapability(
+  db: Database,
+  peerId: string,
+  sessionToken: string,
+): PrepareReplacementResponse {
+  const holder = db.query<{ ok: number }, [string, string]>(
+    "SELECT 1 AS ok FROM peers WHERE id = ? AND session_token = ?",
+  ).get(peerId, sessionToken);
+  if (!holder) throw new SessionExpiredError();
+
+  const now = Date.now();
+  const expiresAtMs = now + REPLACEMENT_CAPABILITY_TTL_MS;
+  const capability = randomBytes(32).toString("base64url");
+  pruneExpiredReplacementCapabilities(now);
+  replacementCapabilities.set(peerId, {
+    peerId,
+    capabilityVerifier: secretVerifier(capability),
+    holderSessionVerifier: secretVerifier(sessionToken),
+    expiresAtMs,
+  });
+  return { capability, expires_at: new Date(expiresAtMs).toISOString() };
+}
+
+function replacementCapabilityMatches(
+  peerId: string,
+  currentSessionToken: string,
+  proof: ReplacementProof | undefined,
+  now: number,
+): boolean {
+  pruneExpiredReplacementCapabilities(now);
+  if (!proof || proof.peer_id !== peerId) return false;
+  const grant = replacementCapabilities.get(peerId);
+  if (!grant || grant.peerId !== peerId || grant.expiresAtMs <= now) return false;
+  return verifierMatches(grant.capabilityVerifier, secretVerifier(proof.capability))
+    && verifierMatches(grant.holderSessionVerifier, secretVerifier(currentSessionToken));
 }
 
 function nowIso(): string { return new Date().toISOString(); }
@@ -316,7 +390,9 @@ function clearUndeliveredLeasesForPeer(db: Database, id: string): void {
 }
 
 export function registerPeer(db: Database, req: RegisterRequest): RegisterResponse {
-  const ts = nowIso();
+  const now = Date.now();
+  const ts = new Date(now).toISOString();
+  const cutoff = new Date(now - STALE_RECLAIM_THRESHOLD_MS).toISOString();
   const tty = normalizedTty(req.tty);
   const host = normalizeHostId(req.host);
   // Every register (fresh or reclaim) issues a new session_token. Reclaim
@@ -325,35 +401,66 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
   // boundary.
   const session_token = randomUUID();
 
-  // Physical-session reconnect fast-path: one interactive tty/cwd/type maps to
-  // one logical peer. Replace in place even when the previous child is still
-  // heartbeating, preserving id/name and inbox continuity while rotating the
-  // session_token so old-child mutations no-op.
+  // A physical tuple is identity-comparison metadata, not replacement
+  // authority. Stale rows remain reclaimable at the strict < cutoff boundary;
+  // active rows require a current-holder-issued one-time capability.
   if (tty) {
-    const row = db.query<{ id: string; name: string }, [string, string | null, string, string]>(
-      `SELECT id, name FROM peers
+    const row = db.query<{
+      id: string;
+      name: string;
+      session_token: string;
+      last_seen: string;
+    }, [string, string | null, string, string]>(
+      `SELECT id, name, session_token, last_seen FROM peers
        WHERE peer_type = ? AND host IS ? AND cwd IS ? AND tty = ?
        ORDER BY last_seen DESC
        LIMIT 1`
     ).get(req.peer_type, host, req.cwd, tty);
     if (row) {
-      db.query(
-        `UPDATE peers
-           SET peer_type = ?, host = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
-               session_token = ?, last_seen = ?
-         WHERE id = ?`
-      ).run(
-        req.peer_type, host, req.pid, req.cwd, req.git_root, tty, req.summary,
-        session_token, ts, row.id,
-      );
-      clearUndeliveredLeasesForPeer(db, row.id);
+      if (row.last_seen < cutoff) {
+        const reclaimStalePhysical = db.transaction(() => {
+          const info = db.query(
+            `UPDATE peers
+               SET peer_type = ?, host = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
+                   session_token = ?, last_seen = ?
+             WHERE id = ? AND last_seen < ?`,
+          ).run(
+            req.peer_type, host, req.pid, req.cwd, req.git_root, tty, req.summary,
+            session_token, ts, row.id, cutoff,
+          );
+          if ((info.changes ?? 0) !== 1) throw new LiveHolderConflictError();
+          clearUndeliveredLeasesForPeer(db, row.id);
+        });
+        reclaimStalePhysical();
+        replacementCapabilities.delete(row.id);
+        return { id: row.id, name: row.name, session_token };
+      }
+
+      if (!replacementCapabilityMatches(row.id, row.session_token, req.replacement, now)) {
+        throw new LiveHolderConflictError();
+      }
+
+      const replaceAuthorizedHolder = db.transaction(() => {
+        const info = db.query(
+          `UPDATE peers
+             SET peer_type = ?, host = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
+                 session_token = ?, last_seen = ?
+           WHERE id = ? AND session_token = ? AND last_seen >= ?`,
+        ).run(
+          req.peer_type, host, req.pid, req.cwd, req.git_root, tty, req.summary,
+          session_token, ts, row.id, row.session_token, cutoff,
+        );
+        if ((info.changes ?? 0) !== 1) throw new LiveHolderConflictError();
+        clearUndeliveredLeasesForPeer(db, row.id);
+      });
+      replaceAuthorizedHolder();
+      replacementCapabilities.delete(row.id);
       return { id: row.id, name: row.name, session_token };
     }
   }
 
   // Reclaim fast-path: stale peer with matching name → UPDATE in place, preserve UUID.
   if (req.name && isValidName(req.name)) {
-    const cutoff = new Date(Date.now() - STALE_RECLAIM_THRESHOLD_MS).toISOString();
     const reclaim = db.query(
       `UPDATE peers
          SET peer_type = ?, host = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
@@ -375,6 +482,7 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
         // is unaffected (acked=0 rows still show up in cli.ts orphaned-messages
         // if the reclaimed peer dies again before reading).
         clearUndeliveredLeasesForPeer(db, row.id);
+        replacementCapabilities.delete(row.id);
         return { id: row.id, name: req.name, session_token };
       }
     }
@@ -423,6 +531,7 @@ export function unregisterPeer(db: Database, id: string, session_token: string):
   const info = db.query("DELETE FROM peers WHERE id = ? AND session_token = ?")
     .run(id, session_token);
   if ((info.changes ?? 0) === 0) throw new SessionExpiredError();
+  replacementCapabilities.delete(id);
 }
 
 export function setPeerSummary(db: Database, id: string, session_token: string, summary: string): void {
@@ -724,6 +833,7 @@ export function renamePeer(db: Database, req: RenamePeerRequest): RenamePeerResp
 // ----- GC -----
 
 export function gcStalePeers(db: Database): number {
+  pruneExpiredReplacementCapabilities();
   const cutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
   const info = db.query("DELETE FROM peers WHERE last_seen < ?").run(cutoff);
   return info.changes ?? 0;
@@ -1003,6 +1113,10 @@ export function startBroker(
 
         switch (url.pathname) {
           case "/register":      return json(registerPeer(db, await readJson(req)));
+          case "/prepare-replacement": {
+            const b = await readJson<PrepareReplacementRequest>(req);
+            return json(issueReplacementCapability(db, b.peer_id, b.session_token));
+          }
           case "/heartbeat":     { const b = await readJson<{ id: string; session_token: string }>(req); heartbeatPeer(db, b.id, b.session_token); return json({ ok: true }); }
           case "/unregister":    { const b = await readJson<{ id: string; session_token: string }>(req); unregisterPeer(db, b.id, b.session_token); return json({ ok: true }); }
           case "/set-summary":   { const b = await readJson<{ id: string; session_token: string; summary: string }>(req); setPeerSummary(db, b.id, b.session_token, b.summary); return json({ ok: true }); }
@@ -1033,6 +1147,9 @@ export function startBroker(
           default: return json({ error: "not found" }, { status: 404 });
         }
       } catch (e) {
+        if (e instanceof LiveHolderConflictError) {
+          return json({ error: "live holder conflict" }, { status: 409 });
+        }
         if (e instanceof SessionExpiredError) {
           return json({ error: "session expired" }, { status: 401 });
         }
