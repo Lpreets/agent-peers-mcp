@@ -33,6 +33,10 @@ export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
 export const DEFAULT_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 export const STALE_THRESHOLD_MS = 60_000;
 export const STALE_RECLAIM_THRESHOLD_MS = 60_000;
+// S348: must stay STRICTLY GREATER than STALE_RECLAIM_THRESHOLD_MS so that a
+// successor's reclaim deterministically beats GC deletion. Equal values make
+// UUID/name/inbox continuity a coin flip. Enforced by broker tests.
+export const PEER_GC_RETENTION_MS = 300_000;
 export const LEASE_DURATION_MS = 30_000;
 export const GC_INTERVAL_MS = 30_000;
 export const REPLACEMENT_CAPABILITY_TTL_MS = 30_000;
@@ -834,7 +838,18 @@ export function renamePeer(db: Database, req: RenamePeerRequest): RenamePeerResp
 
 export function gcStalePeers(db: Database): number {
   pruneExpiredReplacementCapabilities();
-  const cutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
+  // S348: retention is deliberately LONGER than STALE_RECLAIM_THRESHOLD_MS.
+  //
+  // These used to be the same 60s boundary, so GC could delete a stale row at
+  // exactly the moment a successor became able to reclaim it. Whoever won the
+  // race decided whether the successor kept the peer's UUID/name/inbox or
+  // registered as a brand-new peer — silently orphaning messages addressed to
+  // the old UUID. Reclaim must win deterministically, so physical deletion is
+  // held back well past the reclaim window.
+  //
+  // Liveness SEMANTICS are unchanged: a peer is still reported stale/dead at
+  // STALE_THRESHOLD_MS. Only the physical DELETE is delayed.
+  const cutoff = new Date(Date.now() - PEER_GC_RETENTION_MS).toISOString();
   const info = db.query("DELETE FROM peers WHERE last_seen < ?").run(cutoff);
   return info.changes ?? 0;
 }
