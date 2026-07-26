@@ -36,6 +36,7 @@ import { recordDelivered, getRecentDelivered } from "./shared/recent-delivered.t
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import { checkInitialParentLiveness } from "./shared/parent-liveness.ts";
+import { registerWithRetry } from "./shared/register-retry.ts";
 import { createAuthLostHandler } from "./shared/session-loss.ts";
 import type { PeerId, SendMessageResponse } from "./shared/types.ts";
 
@@ -170,13 +171,55 @@ const TOOLS = [
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
+// ---------------------------------------------------------------------------
+// S348 — broker readiness (single-flight). Mirrors codex-server.ts.
+//
+// The MCP stdio transport is attached BEFORE any broker work (see main), so a
+// tool call can arrive while the broker is still being reached, or after that
+// attempt has definitively failed. Blocking moved OUT of startup and INTO the
+// call path: a delay here is visible and recoverable, whereas the same delay at
+// startup was fatal and silent.
+//
+// Invariant: `ready` means registered. Transport-ready is NOT peer-registered,
+// so no send may report acceptance while readiness is not `ready`.
+// ---------------------------------------------------------------------------
+type BrokerReadiness = "initializing" | "ready" | "unavailable";
+let brokerReadiness: BrokerReadiness = "initializing";
+let brokerReadyPromise: Promise<void> | null = null;
+let brokerFailureReason: string | null = null;
+
+/** Bound a tool call's wait on a still-initializing broker. */
+const BROKER_READY_WAIT_MS = 5000;
+
+async function awaitBrokerReadiness(boundMs: number): Promise<BrokerReadiness> {
+  if (brokerReadiness !== "initializing" || !brokerReadyPromise) return brokerReadiness;
+  await Promise.race([
+    brokerReadyPromise,
+    new Promise((r) => setTimeout(r, boundMs)),
+  ]);
+  return brokerReadiness;
+}
+
+function brokerUnavailableText(state: BrokerReadiness): string {
+  return state === "initializing"
+    ? "broker unavailable: still initializing after " +
+        `${BROKER_READY_WAIT_MS}ms; not registered, so this call was not performed. Retry shortly.`
+    : "broker unavailable: initialization failed" +
+        `${brokerFailureReason ? ` (${brokerFailureReason})` : ""}; not registered, so this call was not performed.`;
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
   if (!myId || !mySession) {
-    return {
-      content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-      isError: true,
-    };
+    // S348: bounded wait, then a TYPED broker-unavailable error. Never hang,
+    // never close stdio, never report acceptance we cannot back.
+    const state = await awaitBrokerReadiness(BROKER_READY_WAIT_MS);
+    if (state !== "ready" || !myId || !mySession) {
+      return {
+        content: [{ type: "text" as const, text: brokerUnavailableText(state) }],
+        isError: true,
+      };
+    }
   }
   if (authLost.isLost()) {
     return {
@@ -360,6 +403,34 @@ async function main() {
   setTabTitle("peer:starting");
   startTabTitleKeepalive();
 
+  // ------------------------------------------------------------------------
+  // S348 — ATTACH THE TRANSPORT FIRST. Mirrors codex-server.ts (74e2543).
+  //
+  // Previously every line below ran BEFORE this connect, so any fatal in the
+  // broker path exited having written zero bytes to stdout and the client saw
+  // only "connection closed: initialize response" with no diagnostic. Claude
+  // Code never hit it in the wild only because its MCP client is more patient
+  // at startup than Codex's — luck, not immunity.
+  // Contract locked by tests/claude-transport-attach-first.test.ts.
+  // ------------------------------------------------------------------------
+  await mcp.connect(new StdioServerTransport());
+  log("MCP connected");
+
+  // S348: orphan detection must NOT depend on successful registration —
+  // otherwise a failed background init leaves an unregistered orphan alive
+  // holding the tab-title keepalive indefinitely.
+  const parentWatch = setInterval(() => {
+    const parent = checkInitialParentLiveness(initialParentPid, process.ppid);
+    if (parent.lost) {
+      log(`initial parent pid=${initialParentPid} is gone (current ppid=${process.ppid}, ppid_changed=${parent.ppidChanged}); exiting orphaned MCP server`);
+      clearTabTitleSync();
+      process.exit(0);
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+
+  // S348: broker bring-up is single-flight and BACKGROUND. Its rejection is
+  // caught below and must never reach main().catch(... process.exit(1)).
+  brokerReadyPromise = (async () => {
   const brokerScriptUrl = new URL("./broker.ts", import.meta.url).href;
   await ensureBroker(isBrokerAlive, brokerScriptUrl, {
     remoteMode: BROKER_CONFIG.remoteMode,
@@ -395,16 +466,31 @@ async function main() {
   })();
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  const reg = await client.register({
-    peer_type: "claude",
-    host,
-    name: process.env.PEER_NAME,
-    pid: process.pid,
-    cwd: myCwd,
-    git_root: myGitRoot,
-    tty,
-    summary: initialSummary,
-  });
+  // S348: registration identity is (peer_type, host, cwd, tty) — all four are
+  // IDENTICAL across a `respawn-pane -k` rotation, and the predecessor
+  // heartbeated until it was killed, so its row looks live and we get 409.
+  // Wait the reclaim window out instead of registering exactly once and
+  // staying locked out for the whole session. Safe because the transport is
+  // already attached and PEER_GC_RETENTION_MS outlives the reclaim window.
+  const reg = await registerWithRetry(
+    () => client.register({
+      peer_type: "claude",
+      host,
+      name: process.env.PEER_NAME,
+      pid: process.pid,
+      cwd: myCwd,
+      git_root: myGitRoot,
+      tty,
+      summary: initialSummary,
+    }),
+    // MONOTONIC clock: a backward wall-clock step must not stretch the bound.
+    { now: () => performance.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
+    {
+      onRetry: (attempt, elapsedMs) =>
+        log(`register: live-holder conflict (409) — predecessor row not yet reclaimable; ` +
+            `attempt ${attempt}, ${Math.round(elapsedMs / 1000)}s elapsed, transport stays up`),
+    },
+  );
   myId = reg.id;
   myName = reg.name;
   mySession = reg.session_token;
@@ -429,8 +515,7 @@ async function main() {
     });
   }
 
-  await mcp.connect(new StdioServerTransport());
-  log("MCP connected");
+  // (transport already attached at the top of main — S348)
 
   // In-memory dedupe: message_ids we have already pushed successfully this session.
   // See spec §5.4 for rationale — deterministic dedupe, no model intelligence required.
@@ -543,12 +628,29 @@ async function main() {
   // reclaim-by-name), then sync-clear the title, then exit.
   lifecycleCleanup = async () => {
     clearInterval(hb);
+    clearInterval(parentWatch);
     pushStopped = true;
     if (pushTickTimer) clearTimeout(pushTickTimer);
   };
   // Note: SIGINT / SIGTERM / SIGHUP / SIGQUIT / exit handlers are already
   // registered earlier in main(), before any setTabTitle() call, so terminal
   // close during startup also clears the title.
+  })().then(
+    () => {
+      brokerReadiness = "ready";
+    },
+    (e) => {
+      // S348: terminal, but NOT fatal. The transport stays up and tool calls
+      // return a typed broker-unavailable error instead of the process dying
+      // mid-handshake with no diagnostic.
+      brokerReadiness = "unavailable";
+      brokerFailureReason = e instanceof Error ? e.message : String(e);
+      log(`broker unavailable (transport stays up): ${brokerFailureReason}`);
+      if (!lifecycleCleanup) {
+        lifecycleCleanup = async () => { clearInterval(parentWatch); };
+      }
+    },
+  );
 }
 
 main().catch(async (e) => {
