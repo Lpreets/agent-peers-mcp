@@ -16,6 +16,7 @@ import {
   isLiveHolderConflict,
   REGISTER_RETRY_DEADLINE_MS,
 } from "../shared/register-retry.ts";
+import { STALE_RECLAIM_THRESHOLD_MS } from "../broker.ts";
 
 /** Virtual clock — no wall-clock waiting, fully deterministic. */
 function fakeDeps() {
@@ -31,20 +32,30 @@ function fakeDeps() {
 
 const conflict = () => new BrokerHttpError("/register", 409);
 
-test("retries a /register 409 and succeeds once the holder goes stale", async () => {
+test("INVARIANT: the retry deadline outlives the broker's reclaim threshold", () => {
+  // If the deadline ever drops below the reclaim window, retry can never
+  // succeed and the rotation self-block silently returns.
+  expect(REGISTER_RETRY_DEADLINE_MS).toBeGreaterThan(STALE_RECLAIM_THRESHOLD_MS);
+});
+
+test("succeeds ONLY after waiting past the broker's 60s reclaim threshold", async () => {
   const { deps, elapsed } = fakeDeps();
   let attempts = 0;
   const result = await registerWithRetry(async () => {
     attempts++;
-    // Holder ages out partway through the budget, as a real stale row would.
-    if (attempts < 4) throw conflict();
+    // Mirrors the broker exactly: the predecessor's row is reclaimable only
+    // once it is strictly staler than STALE_RECLAIM_THRESHOLD_MS. Success is
+    // therefore CONDITIONAL on virtual time, not on an attempt count — an
+    // earlier version succeeded at 15s and asserted only elapsed > 0, which
+    // never proved the behaviour the retry exists for.
+    if (deps.now() <= STALE_RECLAIM_THRESHOLD_MS) throw conflict();
     return { id: "peer-1", name: "msaasa-codex", session_token: "tok-new" };
   }, deps);
 
-  expect(attempts).toBe(4);
   expect(result.name).toBe("msaasa-codex");
-  // Must have been willing to wait past the broker's 60s reclaim threshold.
-  expect(elapsed()).toBeGreaterThan(0);
+  expect(elapsed()).toBeGreaterThan(STALE_RECLAIM_THRESHOLD_MS);
+  expect(elapsed()).toBeLessThanOrEqual(REGISTER_RETRY_DEADLINE_MS);
+  expect(attempts).toBeGreaterThan(1);
 });
 
 test("waits past the broker's 60s reclaim threshold before giving up", async () => {

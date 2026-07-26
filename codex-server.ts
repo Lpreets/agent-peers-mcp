@@ -734,7 +734,11 @@ async function main() {
       tty,
       summary: initialSummary,
     }),
-    { now: () => Date.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
+    // MONOTONIC clock, not Date.now(): a backward wall-clock adjustment (NTP
+    // step, DST-adjacent correction, manual set) would otherwise stretch the
+    // 90s bound arbitrarily, making "bounded" false in exactly the conditions
+    // where a machine is least healthy.
+    { now: () => performance.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
     {
       onRetry: (attempt, elapsedMs) =>
         log(`register: live-holder conflict (409) — predecessor row not yet reclaimable; ` +

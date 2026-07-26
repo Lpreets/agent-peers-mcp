@@ -42,6 +42,9 @@ export interface BrokerClientOptions {
   fetchImpl?: FetchLike;
 }
 
+/** S348: per-attempt bound for /register (see the register() comment below). */
+export const REGISTER_REQUEST_TIMEOUT_MS = 10_000;
+
 export class BrokerHttpError extends Error {
   constructor(readonly path: string, readonly status: number) {
     super(`broker ${path}: HTTP ${status}`);
@@ -180,7 +183,15 @@ export function createClient(baseUrl: string, sharedSecret: string, options: Bro
         return res.ok;
       } catch { return false; }
     },
-    register(req) { return post<RegisterResponse>("/register", req); },
+    // S348: registration MUST be individually bounded. It is driven by
+    // registerWithRetry under a 90s deadline, but a deadline around an
+    // unbounded operation is decorative — one hung request would strand
+    // readiness forever and never return control to the retry loop. The abort
+    // surfaces as a TimeoutError, not a BrokerHttpError, so it is correctly
+    // NOT retried by isLiveHolderConflict().
+    register(req) {
+      return postOnce<RegisterResponse>("/register", req, REGISTER_REQUEST_TIMEOUT_MS);
+    },
     async heartbeat(req) { await post("/heartbeat", req); },
     async unregister(req) { await post("/unregister", req); },
     async setSummary(req) { await post("/set-summary", req); },
