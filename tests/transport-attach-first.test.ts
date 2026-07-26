@@ -28,9 +28,29 @@ import { existsSync, unlinkSync } from "node:fs";
 import { resolve } from "node:path";
 
 const REPO = resolve(import.meta.dir, "..");
-// Unreachable + non-loopback => remote mode => no local auto-spawn, no live broker.
-const DEAD_BROKER_URL = "http://10.255.255.1:7900";
 const TEST_SECRET = `/tmp/agent-peers-s348-red-secret-${Date.now()}`;
+
+// Fixture isolation (Codex RV blocker): an earlier draft pointed at a
+// hard-coded non-loopback address and *inferred* remote mode. That is
+// network-dependent — the address is not guaranteed unreachable on every host
+// or CI network, and could contact an unrelated private service. Instead we
+// bind our OWN ephemeral broker that deterministically fails /health, and set
+// AGENT_PEERS_REMOTE=1 explicitly (broker-config.ts:71) so local auto-spawn is
+// disabled regardless of host inference.
+let fakeBroker: ReturnType<typeof Bun.serve> | null = null;
+let healthHits = 0;
+
+function startFakeFailingBroker() {
+  healthHits = 0;
+  return Bun.serve({
+    port: 0, // ephemeral — never collides with the live broker on 7900
+    hostname: "127.0.0.1",
+    fetch() {
+      healthHits++;
+      return new Response("broker down (S348 fixture)", { status: 503 });
+    },
+  });
+}
 
 // Bound for a response that must be answered from the transport alone.
 const RESPONSE_BOUND_MS = 5_000;
@@ -42,10 +62,12 @@ let proc: ReturnType<typeof Bun.spawn> | null = null;
 afterEach(() => {
   proc?.kill();
   proc = null;
+  fakeBroker?.stop(true);
+  fakeBroker = null;
   if (existsSync(TEST_SECRET)) unlinkSync(TEST_SECRET);
 });
 
-function startServer() {
+function startServer(brokerUrl: string) {
   return Bun.spawn({
     cmd: ["bun", "codex-server.ts"],
     cwd: REPO,
@@ -53,7 +75,8 @@ function startServer() {
       ...process.env,
       AGENT_PEERS_ENABLED: "1",
       PEER_NAME: "s348-red-test",
-      AGENT_PEERS_BROKER_URL: DEAD_BROKER_URL,
+      AGENT_PEERS_REMOTE: "1", // explicit: disable local auto-spawn
+      AGENT_PEERS_BROKER_URL: brokerUrl,
       AGENT_PEERS_SECRET_FILE: TEST_SECRET,
     },
     stdin: "pipe",
@@ -104,7 +127,9 @@ function send(p: NonNullable<typeof proc>, msg: unknown) {
 }
 
 test("S348: transport is answerable even when the broker never becomes available", async () => {
-  proc = startServer();
+  fakeBroker = startFakeFailingBroker();
+  const brokerUrl = `http://127.0.0.1:${fakeBroker.port}`;
+  proc = startServer(brokerUrl);
   const out = makeLineReader(proc.stdout as ReadableStream<Uint8Array>);
 
   // --- 1. initialize is answered within a short bound -----------------------
@@ -161,10 +186,14 @@ test("S348: transport is answerable even when the broker never becomes available
   expect(JSON.parse(secondList!).id).toBe(4);
 
   // --- 6. fixture never touched the live broker ----------------------------
-  // Structural: DEAD_BROKER_URL is non-loopback (remote mode => auto-spawn
-  // disabled) and the secret path is a temp file. Asserted so a future edit
-  // that points this at 127.0.0.1 fails loudly instead of silently going live.
-  expect(DEAD_BROKER_URL.includes("127.0.0.1")).toBe(false);
-  expect(DEAD_BROKER_URL.includes("localhost")).toBe(false);
+  // Deterministic by construction: we bound our OWN ephemeral port, so the
+  // failure cannot depend on whether some address happens to be unreachable on
+  // this host or CI network.
+  expect(fakeBroker!.port).not.toBe(7900); // the live broker's port
   expect(TEST_SECRET.startsWith("/tmp/")).toBe(true);
+  // POSITIVE CONTROL: prove the health probe hit OUR fake broker. Without this
+  // the test could pass because the server contacted nothing at all — the same
+  // "cannot distinguish checked-and-failed from never-checked" trap this whole
+  // incident was made of.
+  expect(healthHits).toBeGreaterThan(0);
 }, 30_000);
