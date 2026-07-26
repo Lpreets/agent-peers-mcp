@@ -341,6 +341,43 @@ async function pollBrokerIntoQueue(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// S348 — broker readiness (single-flight).
+//
+// The MCP stdio transport is attached BEFORE any broker work (see main), so a
+// tool call can arrive while the broker is still being reached, or after that
+// attempt has definitively failed. Blocking moved OUT of startup and INTO the
+// call path: a delay here is visible and recoverable, whereas the same delay at
+// startup was fatal and silent.
+//
+// Invariant: `ready` means registered. Transport-ready is NOT peer-registered,
+// so no send may report acceptance while readiness is not `ready`.
+// ---------------------------------------------------------------------------
+type BrokerReadiness = "initializing" | "ready" | "unavailable";
+let brokerReadiness: BrokerReadiness = "initializing";
+let brokerReadyPromise: Promise<void> | null = null;
+let brokerFailureReason: string | null = null;
+
+/** Bound a tool call's wait on a still-initializing broker. */
+const BROKER_READY_WAIT_MS = 5000;
+
+async function awaitBrokerReadiness(boundMs: number): Promise<BrokerReadiness> {
+  if (brokerReadiness !== "initializing" || !brokerReadyPromise) return brokerReadiness;
+  await Promise.race([
+    brokerReadyPromise,
+    new Promise((r) => setTimeout(r, boundMs)),
+  ]);
+  return brokerReadiness;
+}
+
+function brokerUnavailableText(state: BrokerReadiness): string {
+  return state === "initializing"
+    ? "broker unavailable: still initializing after " +
+        `${BROKER_READY_WAIT_MS}ms; not registered, so this call was not performed. Retry shortly.`
+    : "broker unavailable: initialization failed" +
+        `${brokerFailureReason ? ` (${brokerFailureReason})` : ""}; not registered, so this call was not performed.`;
+}
+
 async function withPiggyback(
   handler: () => Promise<{ text: string; isError?: boolean }>,
 ): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
@@ -348,10 +385,15 @@ async function withPiggyback(
     return { content: [{ type: "text", text: AUTH_LOST_TOOL_TEXT }], isError: true };
   }
   if (!myId || !mySession) {
-    return {
-      content: [{ type: "text", text: "Not registered with broker yet" }],
-      isError: true,
-    };
+    // S348: bounded wait, then a TYPED broker-unavailable error. Never hang,
+    // never close stdio, never report acceptance we cannot back.
+    const state = await awaitBrokerReadiness(BROKER_READY_WAIT_MS);
+    if (state !== "ready" || !myId || !mySession) {
+      return {
+        content: [{ type: "text", text: brokerUnavailableText(state) }],
+        isError: true,
+      };
+    }
   }
 
   // ------------------------------------------------------------------------
@@ -611,6 +653,35 @@ async function main() {
   setTabTitle("peer:starting");
   startTabTitleKeepalive();
 
+  // ------------------------------------------------------------------------
+  // S348 — ATTACH THE TRANSPORT FIRST.
+  //
+  // Previously every line below ran BEFORE this connect, so any fatal in the
+  // broker path exited having written zero bytes to stdout. The client saw only
+  // "connection closed: initialize response" with no diagnostic anywhere. Now
+  // `initialize` is answerable immediately and broker trouble is reported
+  // through tool responses instead of killing the process.
+  // Contract locked by tests/transport-attach-first.test.ts.
+  // ------------------------------------------------------------------------
+  await mcp.connect(new StdioServerTransport());
+  log("MCP connected");
+
+  // S348: orphan detection must NOT depend on successful registration —
+  // otherwise a failed background init leaves an unregistered orphan alive
+  // holding the tab-title keepalive indefinitely.
+  const parentWatch = setInterval(() => {
+    const parent = checkInitialParentLiveness(initialParentPid, process.ppid);
+    if (parent.lost) {
+      log(`initial parent pid=${initialParentPid} is gone (current ppid=${process.ppid}, ppid_changed=${parent.ppidChanged}); exiting orphaned MCP server`);
+      clearTabTitleSync();
+      process.exit(0);
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+
+  // S348: broker bring-up is single-flight and BACKGROUND. Its rejection is
+  // caught here and must never reach main().catch(... process.exit(1)) — that
+  // path is what turned a broker problem into a dead transport.
+  brokerReadyPromise = (async () => {
   const brokerScriptUrl = new URL("./broker.ts", import.meta.url).href;
   await ensureBroker(isBrokerAlive, brokerScriptUrl, {
     remoteMode: BROKER_CONFIG.remoteMode,
@@ -677,8 +748,7 @@ async function main() {
     });
   }
 
-  await mcp.connect(new StdioServerTransport());
-  log("MCP connected");
+  // (transport already attached at the top of main — S348)
 
   let pollStopped = false;
   let pollTickTimer: ReturnType<typeof setTimeout> | null = null;
@@ -717,12 +787,29 @@ async function main() {
   // unregister (preserves reclaim-by-name window). Timer cleanup only.
   lifecycleCleanup = async () => {
     clearInterval(hb);
+    clearInterval(parentWatch);
     pollStopped = true;
     if (pollTickTimer) clearTimeout(pollTickTimer);
   };
   // Note: all signal handlers + 'exit' handler are already armed at the top
   // of main(), before any setTabTitle() call — so a terminal close during
   // startup also clears the title.
+  })().then(
+    () => {
+      brokerReadiness = "ready";
+    },
+    (e) => {
+      // S348: terminal, but NOT fatal. The transport stays up and tool calls
+      // return a typed broker-unavailable error instead of the process dying
+      // mid-handshake with no diagnostic.
+      brokerReadiness = "unavailable";
+      brokerFailureReason = e instanceof Error ? e.message : String(e);
+      log(`broker unavailable (transport stays up): ${brokerFailureReason}`);
+      if (!lifecycleCleanup) {
+        lifecycleCleanup = async () => { clearInterval(parentWatch); };
+      }
+    },
+  );
 }
 
 main().catch(async (e) => {
