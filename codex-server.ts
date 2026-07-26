@@ -68,6 +68,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { createClient } from "./shared/broker-client.ts";
+import { registerWithRetry } from "./shared/register-retry.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
 import { readSharedSecretOrThrow, waitForSharedSecret } from "./shared/shared-secret.ts";
 import { resolveBrokerClientConfig } from "./shared/broker-config.ts";
@@ -713,16 +714,33 @@ async function main() {
   })();
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  const reg = await client.register({
-    peer_type: "codex",
-    host,
-    name: process.env.PEER_NAME,
-    pid: process.pid,
-    cwd: myCwd,
-    git_root: myGitRoot,
-    tty,
-    summary: initialSummary,
-  });
+  // S348: registration identity is (peer_type, host, cwd, tty) — all four are
+  // IDENTICAL across a `respawn-pane -k` rotation, and the predecessor
+  // heartbeated until it was killed, so its row looks live and we get 409.
+  // The row becomes reclaimable after the broker's 60s threshold, so wait it
+  // out instead of registering exactly once and staying locked out for the
+  // whole session. Safe because the transport is already attached (readiness
+  // stays `initializing`, tools return the typed error) and because GC
+  // retention now outlives the reclaim window, so the row we are waiting to
+  // reclaim cannot be deleted out from under us.
+  const reg = await registerWithRetry(
+    () => client.register({
+      peer_type: "codex",
+      host,
+      name: process.env.PEER_NAME,
+      pid: process.pid,
+      cwd: myCwd,
+      git_root: myGitRoot,
+      tty,
+      summary: initialSummary,
+    }),
+    { now: () => Date.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
+    {
+      onRetry: (attempt, elapsedMs) =>
+        log(`register: live-holder conflict (409) — predecessor row not yet reclaimable; ` +
+            `attempt ${attempt}, ${Math.round(elapsedMs / 1000)}s elapsed, transport stays up`),
+    },
+  );
   myId = reg.id;
   myName = reg.name;
   mySession = reg.session_token;
